@@ -1,0 +1,135 @@
+@charset "UTF-8";@charset "UTF-8";
+
+/* 기본 설정 */
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+    background-color: #f5f8fa;
+    color: #333;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+}
+
+/* 공통 컨테이너 스타일 */
+div {
+    max-width: 600px;
+    margin: 50px auto;
+    padding: 20px;
+    background-color: #ffffff;
+    border-radius: 10px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* 제목 스타일 */
+h2, h3, h4 {
+    color: #1da1f2;
+    text-align: center;
+}
+
+/* 입력 폼 스타일 */
+form {
+    margin: 20px 0;
+    text-align: center;
+}
+
+input[type="text"] {
+    width: 80%;
+    padding: 10px;
+    margin: 10px 0;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    font-size: 16px;
+}
+
+input[type="submit"] {
+    background-color: #1da1f2;
+    color: white;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+}
+
+input[type="submit"]:hover {
+    background-color: #0d8cd9;
+}
+
+ input[type="reset"] {
+    background-color: #1da1f2;
+    color: white;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+    }
+    
+ input[type="reset"]:hover {
+        background-color: #45a049;
+    }
+
+/* 트윗 리스트 스타일 */
+ul {
+    list-style-type: none;
+    padding: 0;
+}
+
+li {
+    padding: 10px;
+    margin: 10px 0;
+    background-color: #f0f8ff;
+    border-left: 5px solid #1da1f2;
+    border-radius: 5px;
+    font-size: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+li form {
+    margin: 0;
+}
+
+li input[type="submit"] {
+    background-color: #ff4d4d;
+    padding: 5px 10px;
+    font-size: 14px;
+    border-radius: 3px;
+}
+
+li input[type="submit"]:hover {
+    background-color: #e60000;
+}
+
+/* 버튼 스타일 */
+a {
+    display: inline-block;
+    margin: 10px 5px;
+    padding: 10px 20px;
+    text-decoration: none;
+    background-color: #1da1f2;
+    color: white;
+    border-radius: 5px;
+    font-size: 14px;
+    text-align: center;
+    transition: background-color 0.3s ease;
+}
+
+a:hover {
+    background-color: #0d8cd9;
+}
+
+table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+td {
+    padding: 10px;
+    text-align: left;
+}

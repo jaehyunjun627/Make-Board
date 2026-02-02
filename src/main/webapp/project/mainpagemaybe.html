@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kanji Vocab - Main</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="page">
+    <main class="shell">
+
+      <!-- Left Profile Card -->
+      <aside class="profile card">
+        <div class="avatarWrap">
+          <div class="avatar">
+            <!-- 실제로는 img 태그로 교체 가능 -->
+            <span class="avatarEmoji">👩🏻</span>
+          </div>
+        </div>
+        <div class="profileName">전 재현</div>
+      </aside>
+
+      <!-- Right Content -->
+      <section class="content">
+
+        <!-- Study Panel -->
+        <div class="sectionTitle">한자 공부하러 가기</div>
+
+        <div class="card panel">
+          <div class="levelRow">
+            <button class="levelBtn">N5</button>
+            <button class="levelBtn">N4</button>
+            <button class="levelBtn">N3</button>
+            <button class="levelBtn">N2</button>
+            <button class="levelBtn">N1</button>
+          </div>
+        </div>
+
+        <!-- Bottom Area -->
+        <div class="bottomGrid">
+          <!-- Review -->
+          <div class="block">
+            <div class="sectionTitle small">복습하러 가기</div>
+
+            <div class="card panel reviewPanel">
+              <button class="actionCard">
+                <div class="actionIcon">復</div>
+                <div class="actionText">오답 단어 보기</div>
+              </button>
+
+              <button class="actionCard">
+                <div class="actionIcon">絠</div>
+                <div class="actionText">일일 챌린지</div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Calendar -->
+          <div class="block">
+            <div class="sectionTitle small">여긴 뭐넣지 달력?</div>
+
+            <div class="card panel calendarPanel">
+              <div class="month">2月</div>
+
+              <div class="heatmap">
+                <!-- 7 x 4 = 28개 정도로 구성(이미지 느낌) -->
+                <!-- status: red / green / empty -->
+                <div class="cell red"></div>
+                <div class="cell green"></div>
+                <div class="cell green"></div>
+                <div class="cell"></div>
+                <div class="cell"></div>
+                <div class="cell"></div>
+                <div class="cell"></div>
+
+                <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+                <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+                <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </section>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,17 @@
+﻿# Eclipse 설정 파일
+.classpath
+.project
+.settings/
+
+# 컴파일된 파일
+bin/
+target/
+build/
+*.class
+
+# 서버 설정
+Servers/
+
+# 기타
+.DS_Store
+*.log
