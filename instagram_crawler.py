@@ -247,10 +247,49 @@ def collect_posts_from_json_blob(blob: Any, found: list[dict]) -> None:
             collect_posts_from_json_blob(value, found)
 
 
+def has_valid_session_cookie(context) -> bool:
+    """로그인에 성공하면 발급되는 sessionid 쿠키가 있는지 확인합니다.
+
+    이 쿠키가 없으면 로그인이 안 된 상태(또는 만료된 상태)라고 봅니다.
+    """
+    cookies = context.cookies("https://www.instagram.com")
+    return any(c.get("name") == "sessionid" and c.get("value") for c in cookies)
+
+
+def scroll_to_bottom(page) -> None:
+    """페이지를 문서 맨 아래까지 내려 다음 게시물 묶음을 불러오게 합니다.
+
+    인스타그램 프로필은 처음에 12건만 주고, 화면 끝에 닿아야 다음 묶음을 요청합니다.
+    브라우저마다/화면마다 스크롤되는 요소가 달라서 세 가지 방법을 함께 씁니다.
+    """
+    # 1) 문서 전체를 맨 아래로
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+
+    # 2) 내부에 따로 스크롤되는 컨테이너가 있는 경우까지 대비
+    page.evaluate(
+        """
+        () => {
+          for (const el of document.querySelectorAll('main, main div, [role=main]')) {
+            if (el.scrollHeight > el.clientHeight + 50) {
+              el.scrollTop = el.scrollHeight;
+            }
+          }
+        }
+        """
+    )
+
+    # 3) 키보드 End — 위 두 방법이 막힌 레이아웃에서의 마지막 수단
+    try:
+        page.keyboard.press("End")
+    except Exception:
+        pass  # 포커스가 없으면 무시하고 넘어갑니다.
+
+
 def save_login_session(session_file: str = DEFAULT_SESSION_FILE) -> None:
     """브라우저를 열어 사용자가 직접 로그인하게 하고, 그 세션(쿠키)을 저장합니다.
 
     한 번만 해두면 이후 crawl 명령에서 계속 재사용됩니다.
+    로그인이 실제로 됐는지(세션 쿠키 존재 여부)를 확인한 뒤에만 저장합니다.
     """
     from playwright.sync_api import sync_playwright  # 필요할 때만 불러옵니다.
 
@@ -266,7 +305,22 @@ def save_login_session(session_file: str = DEFAULT_SESSION_FILE) -> None:
         print(" 브라우저 창에서 인스타그램에 로그인해 주세요.")
         print(" 로그인이 끝나 피드가 보이면, 이 터미널로 돌아와 Enter 를 누르세요.")
         print("=" * 60)
-        input(" 로그인을 마쳤으면 Enter > ")
+
+        # 로그인 성공(세션 쿠키 발급)을 확인할 때까지 재확인을 반복합니다.
+        while True:
+            input(" 로그인을 마쳤으면 Enter > ")
+            if has_valid_session_cookie(context):
+                print(" [확인] 로그인 세션을 확인했습니다.")
+                break
+
+            print(
+                " [확인 실패] 로그인이 완료되지 않은 것 같습니다(세션 쿠키를 찾지 못했습니다).\n"
+                " 브라우저 창이 로그인 화면이 아니라 피드 화면인지 확인한 뒤 다시 Enter를 눌러주세요."
+            )
+            force = input(" 그래도 지금 상태로 저장할까요? (y/N) > ").strip().lower()
+            if force == "y":
+                print(" [주의] 로그인 미확인 상태로 저장합니다. crawl 시 게시물이 안 모일 수 있습니다.")
+                break
 
         context.storage_state(path=session_file)
         browser.close()
@@ -336,6 +390,15 @@ def fetch_posts_live(
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(int(delay * 1000))
 
+        # 로그인 페이지나 보안 확인(checkpoint) 화면으로 튕겨나갔는지 확인합니다.
+        # 여기서 걸러내지 않으면 그냥 게시물 0건으로 조용히 끝나버려 원인을 알기 어렵습니다.
+        if "/accounts/login" in page.url or "/challenge" in page.url:
+            browser.close()
+            raise RuntimeError(
+                "로그인이 필요합니다. 세션이 없거나 만료된 것으로 보입니다. "
+                "'python instagram_crawler.py login' 을 다시 실행해 세션을 새로 만들어주세요."
+            )
+
         idle_scrolls = 0        # 스크롤해도 새 게시물이 안 늘어난 횟수
         old_post_hits = 0       # start_date 보다 오래된 게시물을 만난 횟수
         previous_count = 0
@@ -358,7 +421,9 @@ def fetch_posts_live(
                     break
 
             # (c) 스크롤해서 다음 페이지를 불러옵니다(= 페이지네이션).
-            page.mouse.wheel(0, 4000)
+            #     mouse.wheel 만 쓰면 마우스 위치가 스크롤 영역 밖일 때 아무 일도
+            #     일어나지 않습니다. 그래서 실제로 문서 끝까지 내리는 방식을 씁니다.
+            scroll_to_bottom(page)
             page.wait_for_timeout(int(delay * 1000))
 
             if len(collected) == previous_count:
@@ -378,6 +443,12 @@ def fetch_posts_live(
             previous_count = len(collected)
 
         browser.close()
+
+    if not collected:
+        print(
+            "[주의] 게시물을 하나도 찾지 못했습니다. 계정 아이디 철자를 확인하시고, "
+            "비공개 계정이라면 로그인 세션이 그 계정을 팔로우하는 상태인지 확인해주세요."
+        )
 
     return collected
 
@@ -523,16 +594,62 @@ def parse_data(
 # ---------------------------------------------------------------------------
 
 
+def build_output_path(account: str | None, explicit_out: str | None = None) -> str:
+    """저장할 CSV 파일 이름을 만듭니다.
+
+    --out 을 직접 주면 그 값을 그대로 쓰고,
+    안 주면 'result_계정명_YYMMDDHHMM.csv' 형태로 자동 생성합니다.
+      예) result_bmwmotorradkorea_2608101634.csv
+
+    실행할 때마다 이름이 달라지므로
+    - 엑셀로 이전 결과를 열어둔 채 다시 돌려도 충돌하지 않고
+    - 언제 어느 계정을 조회한 결과인지 파일만 봐도 알 수 있습니다.
+    """
+    if explicit_out:
+        return explicit_out
+
+    # 파일 이름에 쓸 수 없는 글자(\ / : * ? " < > |)를 밑줄로 바꿉니다.
+    safe_account = re.sub(r'[\\/:*?"<>|\s]', "_", account or "unknown")
+    stamp = datetime.now().strftime("%y%m%d%H%M")  # 예: 2608101634
+    return f"result_{safe_account}_{stamp}.csv"
+
+
+def guess_account_from_posts(raw_posts: list[dict]) -> str | None:
+    """게시물 데이터 안에 들어있는 계정 아이디를 찾아봅니다(from-json 용).
+
+    수집 도구마다 위치가 달라서 흔한 자리들을 차례로 확인합니다.
+    """
+    for post in raw_posts[:20]:  # 앞쪽 몇 건만 봐도 충분합니다.
+        if not isinstance(post, dict):
+            continue
+        name = (
+            get_first(post, "ownerUsername", "username", "owner_username")
+            or dig(post, "owner", "username")
+            or dig(post, "user", "username")
+        )
+        if name:
+            return str(name)
+    return None
+
+
 def export_csv(rows: list[dict], output_path: str = "result.csv") -> None:
     """결과를 CSV 파일로 저장합니다.
 
     encoding='utf-8-sig' 는 'UTF-8 with BOM' 입니다.
     이걸 써야 윈도우 엑셀에서 한글이 깨지지 않습니다.
     """
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            writer.writeheader()
+            writer.writerows(rows)
+    except PermissionError:
+        # 윈도우에서 해당 CSV를 엑셀로 열어둔 경우가 대부분입니다.
+        raise SystemExit(
+            f"[오류] '{output_path}' 파일에 쓸 수 없습니다.\n"
+            f"       이 파일을 엑셀 등 다른 프로그램에서 열어두고 있다면 닫은 뒤 다시 실행해주세요.\n"
+            f"       (또는 --out 옵션으로 다른 파일 이름을 지정하세요.)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +709,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_json.add_argument("--start", help="시작 날짜 YYYY-MM-DD")
     p_json.add_argument("--end", help="종료 날짜 YYYY-MM-DD")
-    p_json.add_argument("--out", default="result.csv", help="저장할 CSV 경로 (기본: result.csv)")
+    p_json.add_argument(
+        "--out",
+        default=None,
+        help="저장할 CSV 경로 (기본: result_계정명_YYMMDDHHMM.csv 로 자동 생성)",
+    )
 
     # --- login : 세션 저장 --------------------------------------------------
     p_login = subparsers.add_parser("login", help="브라우저를 열어 로그인하고 세션을 저장합니다.")
@@ -606,7 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_crawl.add_argument("--start", help="시작 날짜 YYYY-MM-DD")
     p_crawl.add_argument("--end", help="종료 날짜 YYYY-MM-DD")
     p_crawl.add_argument("--limit", type=int, default=200, help="최대 수집 게시물 수 (기본: 200)")
-    p_crawl.add_argument("--out", default="result.csv", help="저장할 CSV 경로 (기본: result.csv)")
+    p_crawl.add_argument(
+        "--out",
+        default=None,
+        help="저장할 CSV 경로 (기본: result_계정명_YYMMDDHHMM.csv 로 자동 생성)",
+    )
     p_crawl.add_argument(
         "--session-file", default=DEFAULT_SESSION_FILE, help=f"사용할 세션 파일 (기본: {DEFAULT_SESSION_FILE})"
     )
@@ -645,9 +770,12 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("[오류] --start 가 --end 보다 늦습니다.")
 
     # 1단계: 원본 데이터 확보
+    username: str | None = None
     try:
         if args.command == "from-json":
             raw_posts = fetch_posts_from_json(args.json_path)
+            # 파일 이름에 넣을 계정명을 데이터 안에서 찾아봅니다.
+            username = guess_account_from_posts(raw_posts)
         else:  # crawl
             username = extract_username(args.account)
             raw_posts = fetch_posts_live(
@@ -682,8 +810,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # 2~4단계: 정리 → 5단계: 저장
     rows = parse_data(raw_posts, start_date=start_date, end_date=end_date)
-    export_csv(rows, args.out)
-    report(rows, len(raw_posts), args.out)
+    output_path = build_output_path(username, args.out)
+    export_csv(rows, output_path)
+    report(rows, len(raw_posts), output_path)
     return 0
 
 
