@@ -255,6 +255,35 @@ def looks_like_post(node: Any) -> bool:
     return has_code and has_time
 
 
+def post_owner_username(post: dict) -> str | None:
+    """게시물을 올린 계정의 아이디를 찾아냅니다(소문자로 통일).
+
+    인스타그램은 프로필 화면에도 '추천 게시물' 등 다른 계정의 글을 함께 내려줍니다.
+    그것들을 걸러내려면 각 게시물의 주인이 누구인지 알아야 합니다.
+    """
+    for path in (("user", "username"), ("owner", "username"), ("node", "owner", "username")):
+        value = dig(post, *path)
+        if value:
+            return str(value).lower()
+
+    value = get_first(post, "ownerUsername", "owner_username")
+    return str(value).lower() if value else None
+
+
+def post_owner_id(post: dict) -> str | None:
+    """게시물을 올린 계정의 숫자 ID를 찾아냅니다.
+
+    아이디(username)가 응답에 없을 때를 대비한 두 번째 판별 수단입니다.
+    """
+    for path in (("user", "pk"), ("user", "id"), ("owner", "id"), ("owner", "pk")):
+        value = dig(post, *path)
+        if value:
+            return str(value)
+
+    value = get_first(post, "ownerId", "owner_id", "user_id")
+    return str(value) if value else None
+
+
 def collect_posts_from_json_blob(blob: Any, found: list[dict]) -> None:
     """응답 JSON 전체를 재귀적으로 훑으며 게시물처럼 생긴 것들을 모읍니다."""
     if isinstance(blob, dict):
@@ -358,6 +387,7 @@ def fetch_posts_live(
     headless: bool = True,
     delay: float = 2.0,
     max_idle_scrolls: int = 5,
+    owner_filter: bool = True,
 ) -> tuple[list[dict], int | None]:
     """Playwright 브라우저로 계정 페이지를 열고 스크롤하며 게시물을 수집합니다.
 
@@ -366,14 +396,21 @@ def fetch_posts_live(
     - 그 응답(JSON)을 가로채서 게시물 정보를 그대로 확보합니다.
       → HTML 태그를 파싱하는 것보다 훨씬 안정적입니다.
 
+    중요: 인스타그램은 프로필 화면에도 '추천 게시물' 같은 남의 계정 글을 섞어 내려줍니다.
+    그래서 게시물마다 주인이 누구인지 확인해서, 조회 대상 계정의 글만 남깁니다.
+
     돌려주는 값: (게시물 목록, 팔로워 수 또는 None)
     팔로워 수는 참여율 계산에 쓰이며, 프로필 응답에서 자동으로 찾습니다.
     """
     from playwright.sync_api import sync_playwright
 
+    target = username.lower()
     collected: list[dict] = []
     seen_codes: set[str] = set()
     follower_box: list[int] = []  # 콜백 안에서 값을 담아두기 위한 그릇
+    target_id_box: list[str] = []  # 조회 대상 계정의 숫자 ID
+    rejected: Counter = Counter()  # 걸러낸 계정별 건수(끝에 보고용)
+    unknown_owner: list[dict] = []  # 주인을 알 수 없어 보류한 게시물
 
     def handle_response(response) -> None:
         """네트워크 응답이 올 때마다 호출되는 함수(콜백)."""
@@ -397,9 +434,37 @@ def fetch_posts_live(
         collect_posts_from_json_blob(body, found)
         for post in found:
             code = get_first(post, "code", "shortcode", "shortCode")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                collected.append(post)
+            if not code or code in seen_codes:
+                continue
+
+            owner = post_owner_username(post)
+
+            # 대상 계정의 숫자 ID를 알아두면, 아이디가 없는 응답도 판별할 수 있습니다.
+            if owner == target and not target_id_box:
+                owner_id = post_owner_id(post)
+                if owner_id:
+                    target_id_box.append(owner_id)
+
+            if owner_filter:
+                if owner is not None:
+                    if owner != target:
+                        # 추천 게시물 등 남의 계정 글 → 버립니다.
+                        rejected[owner] += 1
+                        continue
+                else:
+                    # 아이디가 없으면 숫자 ID로 한 번 더 확인합니다.
+                    owner_id = post_owner_id(post)
+                    if owner_id and target_id_box and owner_id != target_id_box[0]:
+                        rejected[f"id:{owner_id}"] += 1
+                        continue
+                    if owner_id is None:
+                        # 주인을 전혀 알 수 없는 게시물은 일단 보류해 둡니다.
+                        seen_codes.add(code)
+                        unknown_owner.append(post)
+                        continue
+
+            seen_codes.add(code)
+            collected.append(post)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -476,6 +541,28 @@ def fetch_posts_live(
             previous_count = len(collected)
 
         browser.close()
+
+    # --- 걸러낸 결과 보고 ---------------------------------------------------
+    if rejected:
+        total_rejected = sum(rejected.values())
+        top = ", ".join(f"@{name}({count}건)" for name, count in rejected.most_common(5))
+        print(f"[정보] 다른 계정의 게시물 {total_rejected}건 제외: {top}")
+
+    if unknown_owner:
+        # 주인을 판별할 수 없는 게시물이 남았을 때의 처리.
+        # 대상 계정 글이 이미 충분히 잡혔다면, 정체 불명은 버리는 쪽이 안전합니다.
+        if collected:
+            print(
+                f"[정보] 계정을 확인할 수 없는 게시물 {len(unknown_owner)}건은 제외했습니다. "
+                "(포함하려면 --no-owner-filter)"
+            )
+        else:
+            # 하나도 못 건졌다면 판별 실패일 가능성이 크므로 되살립니다.
+            print(
+                f"[주의] 계정 확인에 실패해, 판별되지 않은 {len(unknown_owner)}건을 그대로 포함합니다.\n"
+                "       다른 계정의 게시물이 섞여 있을 수 있으니 결과를 확인해주세요."
+            )
+            collected.extend(unknown_owner)
 
     if not collected:
         print(
@@ -950,15 +1037,19 @@ def parse_data(
     start_date: str | None = None,
     end_date: str | None = None,
     followers: int | None = None,
+    account: str | None = None,
 ) -> list[dict]:
     """원본 게시물 목록 → 최종 CSV 행 목록.
 
     1. 각 게시물을 공통 형태로 변환
-    2. code 기준 중복 제거
-    3. 시작/종료 날짜로 기간 필터
-    4. 참여율 계산 (팔로워 수를 아는 경우에만)
-    5. 날짜 내림차순(최신순) 정렬
+    2. account 를 주면 그 계정의 게시물만 남김(다른 계정 글 제외)
+    3. code 기준 중복 제거
+    4. 시작/종료 날짜로 기간 필터
+    5. 참여율 계산 (팔로워 수를 아는 경우에만)
+    6. 날짜 내림차순(최신순) 정렬
     """
+    target = account.lower() if account else None
+    foreign_count = 0
     seen_codes: set[str] = set()
     rows: list[dict] = []
 
@@ -966,29 +1057,40 @@ def parse_data(
         if not isinstance(post, dict):
             continue
 
+        # 2. 계정 필터 — 다른 계정의 게시물(추천 글 등)을 걸러냅니다.
+        #    주인을 알 수 없는 게시물은 여기서 거르지 않습니다(수집 단계에서 이미 처리).
+        if target:
+            owner = post_owner_username(post)
+            if owner is not None and owner != target:
+                foreign_count += 1
+                continue
+
         row = normalize_post(post)
         if row is None:
             continue
 
-        # 2. 중복 제거 — 같은 게시물이 여러 번 잡히는 일이 흔합니다.
+        # 3. 중복 제거 — 같은 게시물이 여러 번 잡히는 일이 흔합니다.
         code = row.pop("_code")
         if code in seen_codes:
             continue
         seen_codes.add(code)
 
-        # 3. 기간 필터 — 날짜 문자열이 YYYY-MM-DD 라 문자열 비교로도 정확합니다.
+        # 4. 기간 필터 — 날짜 문자열이 YYYY-MM-DD 라 문자열 비교로도 정확합니다.
         date = row["날짜"]
         if start_date and (not date or date < start_date):
             continue
         if end_date and (not date or date > end_date):
             continue
 
-        # 4. 참여율 계산 — 팔로워 수를 모르면 빈 칸으로 남습니다.
+        # 5. 참여율 계산 — 팔로워 수를 모르면 빈 칸으로 남습니다.
         row["참여율(%)"] = calc_engagement_rate(row["좋아요"], row["댓글"], followers)
 
         rows.append(row)
 
-    # 4. 최신순 정렬
+    if foreign_count:
+        print(f"[정보] @{target} 이외 계정의 게시물 {foreign_count}건을 제외했습니다.")
+
+    # 6. 최신순 정렬
     rows.sort(key=lambda r: r["날짜"], reverse=True)
     return rows
 
@@ -1283,6 +1385,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_crawl.add_argument("--show-browser", action="store_true", help="브라우저 창을 보이게 실행합니다.")
     p_crawl.add_argument(
+        "--no-owner-filter",
+        action="store_true",
+        help=(
+            "계정 확인 없이 화면에 보인 게시물을 모두 수집합니다. "
+            "(주의: 인스타그램이 끼워넣는 '추천 게시물' 등 남의 계정 글이 섞입니다)"
+        ),
+    )
+    p_crawl.add_argument(
         "--delay", type=float, default=2.0, help="스크롤 사이 대기 시간(초). 차단이 잦으면 늘리세요. (기본: 2.0)"
     )
     p_crawl.add_argument(
@@ -1334,6 +1444,7 @@ def main(argv: list[str] | None = None) -> int:
                 session_file=args.session_file,
                 headless=not args.show_browser,
                 delay=args.delay,
+                owner_filter=not args.no_owner_filter,
             )
             if args.save_json:
                 with open(args.save_json, "w", encoding="utf-8") as f:
@@ -1367,7 +1478,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # 2~4단계: 정리 → 5단계: 저장
-    rows = parse_data(raw_posts, start_date=start_date, end_date=end_date, followers=followers)
+    # crawl 은 대상 계정이 확실하므로 정리 단계에서 한 번 더 걸러냅니다(이중 안전장치).
+    account_filter = username if args.command == "crawl" and not args.no_owner_filter else None
+    rows = parse_data(
+        raw_posts,
+        start_date=start_date,
+        end_date=end_date,
+        followers=followers,
+        account=account_filter,
+    )
     output_path = build_output_path(username, args.out)
     sheets = build_all_sheets(rows, top_n=args.top, trend_days=args.trend_days)
     written_paths = export_result(sheets, output_path)
