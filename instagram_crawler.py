@@ -247,10 +247,20 @@ def collect_posts_from_json_blob(blob: Any, found: list[dict]) -> None:
             collect_posts_from_json_blob(value, found)
 
 
+def has_valid_session_cookie(context) -> bool:
+    """로그인에 성공하면 발급되는 sessionid 쿠키가 있는지 확인합니다.
+
+    이 쿠키가 없으면 로그인이 안 된 상태(또는 만료된 상태)라고 봅니다.
+    """
+    cookies = context.cookies("https://www.instagram.com")
+    return any(c.get("name") == "sessionid" and c.get("value") for c in cookies)
+
+
 def save_login_session(session_file: str = DEFAULT_SESSION_FILE) -> None:
     """브라우저를 열어 사용자가 직접 로그인하게 하고, 그 세션(쿠키)을 저장합니다.
 
     한 번만 해두면 이후 crawl 명령에서 계속 재사용됩니다.
+    로그인이 실제로 됐는지(세션 쿠키 존재 여부)를 확인한 뒤에만 저장합니다.
     """
     from playwright.sync_api import sync_playwright  # 필요할 때만 불러옵니다.
 
@@ -266,7 +276,22 @@ def save_login_session(session_file: str = DEFAULT_SESSION_FILE) -> None:
         print(" 브라우저 창에서 인스타그램에 로그인해 주세요.")
         print(" 로그인이 끝나 피드가 보이면, 이 터미널로 돌아와 Enter 를 누르세요.")
         print("=" * 60)
-        input(" 로그인을 마쳤으면 Enter > ")
+
+        # 로그인 성공(세션 쿠키 발급)을 확인할 때까지 재확인을 반복합니다.
+        while True:
+            input(" 로그인을 마쳤으면 Enter > ")
+            if has_valid_session_cookie(context):
+                print(" [확인] 로그인 세션을 확인했습니다.")
+                break
+
+            print(
+                " [확인 실패] 로그인이 완료되지 않은 것 같습니다(세션 쿠키를 찾지 못했습니다).\n"
+                " 브라우저 창이 로그인 화면이 아니라 피드 화면인지 확인한 뒤 다시 Enter를 눌러주세요."
+            )
+            force = input(" 그래도 지금 상태로 저장할까요? (y/N) > ").strip().lower()
+            if force == "y":
+                print(" [주의] 로그인 미확인 상태로 저장합니다. crawl 시 게시물이 안 모일 수 있습니다.")
+                break
 
         context.storage_state(path=session_file)
         browser.close()
@@ -336,6 +361,15 @@ def fetch_posts_live(
         page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(int(delay * 1000))
 
+        # 로그인 페이지나 보안 확인(checkpoint) 화면으로 튕겨나갔는지 확인합니다.
+        # 여기서 걸러내지 않으면 그냥 게시물 0건으로 조용히 끝나버려 원인을 알기 어렵습니다.
+        if "/accounts/login" in page.url or "/challenge" in page.url:
+            browser.close()
+            raise RuntimeError(
+                "로그인이 필요합니다. 세션이 없거나 만료된 것으로 보입니다. "
+                "'python instagram_crawler.py login' 을 다시 실행해 세션을 새로 만들어주세요."
+            )
+
         idle_scrolls = 0        # 스크롤해도 새 게시물이 안 늘어난 횟수
         old_post_hits = 0       # start_date 보다 오래된 게시물을 만난 횟수
         previous_count = 0
@@ -378,6 +412,12 @@ def fetch_posts_live(
             previous_count = len(collected)
 
         browser.close()
+
+    if not collected:
+        print(
+            "[주의] 게시물을 하나도 찾지 못했습니다. 계정 아이디 철자를 확인하시고, "
+            "비공개 계정이라면 로그인 세션이 그 계정을 팔로우하는 상태인지 확인해주세요."
+        )
 
     return collected
 
