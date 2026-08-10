@@ -3,13 +3,19 @@ instagram_crawler.py
 ====================
 
 인스타그램 계정의 게시물(포스트) 단위 참여 지표를 수집해서
-한글 컬럼의 CSV(result.csv)로 저장하는 프로그램입니다.
+시트 3개짜리 엑셀 파일로 저장하는 프로그램입니다.
+
+만들어지는 시트
+-------------------------------------------------
+1) 게시물     : 게시물 목록 + 평균/최고치/최저치/표준편차 요약
+2) 주간 업로드 : 주 평균 업로드 횟수, 최다·최저 업로드 주간, 평균 업로드 주기
+3) 해시태그   : 많이 쓴 해시태그 TOP N, 떠오르는 해시태그, 전체 순위
 
 파이썬을 처음 배우신 분도 따라올 수 있도록, 각 단계마다 주석을 달았습니다.
 
 사용법 요약 (자세한 내용은 README.md 참고)
 -------------------------------------------------
-1) 이미 받아둔 JSON 파일을 CSV로 변환하기 (가장 쉬움, 로그인 불필요)
+1) 이미 받아둔 JSON 파일로 분석하기 (가장 쉬움, 로그인 불필요)
    python instagram_crawler.py from-json
    python instagram_crawler.py from-json dataset_instagram-scraper_2026-08-10.json
 
@@ -23,8 +29,10 @@ instagram_crawler.py
 - fetch_posts_from_json() : JSON 파일에서 게시물 원본(raw)을 읽어옴
 - fetch_posts_live()      : Playwright 브라우저로 인스타그램에서 직접 수집
 - normalize_post()        : 서로 다른 필드 이름을 하나의 공통 형태로 정리
-- parse_data()            : 중복 제거 + 기간 필터 + 날짜 내림차순 정렬
-- export_csv()            : utf-8-sig(엑셀 호환) CSV로 저장
+- parse_data()            : 중복 제거 + 기간 필터 + 참여율 계산 + 최신순 정렬
+- build_weekly_sheet()    : 주간 업로드 빈도 분석
+- build_hashtag_sheet()   : 해시태그 순위 + 트렌드 분석
+- export_result()         : 엑셀(시트 3개) 또는 CSV 여러 개로 저장
 - main()                  : 커맨드라인(CLI) 진입점
 """
 
@@ -38,7 +46,8 @@ import os
 import re
 import statistics
 import sys
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 # ---------------------------------------------------------------------------
@@ -51,6 +60,14 @@ CSV_FIELDNAMES = ["구분", "날짜", "타입", "좋아요", "댓글", "참여�
 
 # 요약 통계를 계산할 숫자 컬럼들
 SUMMARY_METRICS = ["좋아요", "댓글", "참여율(%)"]
+
+# 엑셀 파일의 시트 이름
+SHEET_POSTS = "게시물"
+SHEET_WEEKLY = "주간 업로드"
+SHEET_HASHTAG = "해시태그"
+
+# 해시태그 트렌드 비교 기간(일). 최근 90일 vs 그 이전 90일을 비교합니다.
+DEFAULT_TREND_DAYS = 90
 
 # 브라우저 로그인 정보(쿠키)를 저장해 둘 파일 이름.
 DEFAULT_SESSION_FILE = "session.json"
@@ -238,6 +255,35 @@ def looks_like_post(node: Any) -> bool:
     return has_code and has_time
 
 
+def post_owner_username(post: dict) -> str | None:
+    """게시물을 올린 계정의 아이디를 찾아냅니다(소문자로 통일).
+
+    인스타그램은 프로필 화면에도 '추천 게시물' 등 다른 계정의 글을 함께 내려줍니다.
+    그것들을 걸러내려면 각 게시물의 주인이 누구인지 알아야 합니다.
+    """
+    for path in (("user", "username"), ("owner", "username"), ("node", "owner", "username")):
+        value = dig(post, *path)
+        if value:
+            return str(value).lower()
+
+    value = get_first(post, "ownerUsername", "owner_username")
+    return str(value).lower() if value else None
+
+
+def post_owner_id(post: dict) -> str | None:
+    """게시물을 올린 계정의 숫자 ID를 찾아냅니다.
+
+    아이디(username)가 응답에 없을 때를 대비한 두 번째 판별 수단입니다.
+    """
+    for path in (("user", "pk"), ("user", "id"), ("owner", "id"), ("owner", "pk")):
+        value = dig(post, *path)
+        if value:
+            return str(value)
+
+    value = get_first(post, "ownerId", "owner_id", "user_id")
+    return str(value) if value else None
+
+
 def collect_posts_from_json_blob(blob: Any, found: list[dict]) -> None:
     """응답 JSON 전체를 재귀적으로 훑으며 게시물처럼 생긴 것들을 모읍니다."""
     if isinstance(blob, dict):
@@ -341,6 +387,7 @@ def fetch_posts_live(
     headless: bool = True,
     delay: float = 2.0,
     max_idle_scrolls: int = 5,
+    owner_filter: bool = True,
 ) -> tuple[list[dict], int | None]:
     """Playwright 브라우저로 계정 페이지를 열고 스크롤하며 게시물을 수집합니다.
 
@@ -349,14 +396,21 @@ def fetch_posts_live(
     - 그 응답(JSON)을 가로채서 게시물 정보를 그대로 확보합니다.
       → HTML 태그를 파싱하는 것보다 훨씬 안정적입니다.
 
+    중요: 인스타그램은 프로필 화면에도 '추천 게시물' 같은 남의 계정 글을 섞어 내려줍니다.
+    그래서 게시물마다 주인이 누구인지 확인해서, 조회 대상 계정의 글만 남깁니다.
+
     돌려주는 값: (게시물 목록, 팔로워 수 또는 None)
     팔로워 수는 참여율 계산에 쓰이며, 프로필 응답에서 자동으로 찾습니다.
     """
     from playwright.sync_api import sync_playwright
 
+    target = username.lower()
     collected: list[dict] = []
     seen_codes: set[str] = set()
     follower_box: list[int] = []  # 콜백 안에서 값을 담아두기 위한 그릇
+    target_id_box: list[str] = []  # 조회 대상 계정의 숫자 ID
+    rejected: Counter = Counter()  # 걸러낸 계정별 건수(끝에 보고용)
+    unknown_owner: list[dict] = []  # 주인을 알 수 없어 보류한 게시물
 
     def handle_response(response) -> None:
         """네트워크 응답이 올 때마다 호출되는 함수(콜백)."""
@@ -380,9 +434,37 @@ def fetch_posts_live(
         collect_posts_from_json_blob(body, found)
         for post in found:
             code = get_first(post, "code", "shortcode", "shortCode")
-            if code and code not in seen_codes:
-                seen_codes.add(code)
-                collected.append(post)
+            if not code or code in seen_codes:
+                continue
+
+            owner = post_owner_username(post)
+
+            # 대상 계정의 숫자 ID를 알아두면, 아이디가 없는 응답도 판별할 수 있습니다.
+            if owner == target and not target_id_box:
+                owner_id = post_owner_id(post)
+                if owner_id:
+                    target_id_box.append(owner_id)
+
+            if owner_filter:
+                if owner is not None:
+                    if owner != target:
+                        # 추천 게시물 등 남의 계정 글 → 버립니다.
+                        rejected[owner] += 1
+                        continue
+                else:
+                    # 아이디가 없으면 숫자 ID로 한 번 더 확인합니다.
+                    owner_id = post_owner_id(post)
+                    if owner_id and target_id_box and owner_id != target_id_box[0]:
+                        rejected[f"id:{owner_id}"] += 1
+                        continue
+                    if owner_id is None:
+                        # 주인을 전혀 알 수 없는 게시물은 일단 보류해 둡니다.
+                        seen_codes.add(code)
+                        unknown_owner.append(post)
+                        continue
+
+            seen_codes.add(code)
+            collected.append(post)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -459,6 +541,28 @@ def fetch_posts_live(
             previous_count = len(collected)
 
         browser.close()
+
+    # --- 걸러낸 결과 보고 ---------------------------------------------------
+    if rejected:
+        total_rejected = sum(rejected.values())
+        top = ", ".join(f"@{name}({count}건)" for name, count in rejected.most_common(5))
+        print(f"[정보] 다른 계정의 게시물 {total_rejected}건 제외: {top}")
+
+    if unknown_owner:
+        # 주인을 판별할 수 없는 게시물이 남았을 때의 처리.
+        # 대상 계정 글이 이미 충분히 잡혔다면, 정체 불명은 버리는 쪽이 안전합니다.
+        if collected:
+            print(
+                f"[정보] 계정을 확인할 수 없는 게시물 {len(unknown_owner)}건은 제외했습니다. "
+                "(포함하려면 --no-owner-filter)"
+            )
+        else:
+            # 하나도 못 건졌다면 판별 실패일 가능성이 크므로 되살립니다.
+            print(
+                f"[주의] 계정 확인에 실패해, 판별되지 않은 {len(unknown_owner)}건을 그대로 포함합니다.\n"
+                "       다른 계정의 게시물이 섞여 있을 수 있으니 결과를 확인해주세요."
+            )
+            collected.extend(unknown_owner)
 
     if not collected:
         print(
@@ -645,20 +749,307 @@ def build_summary_rows(rows: list[dict]) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# 주간 업로드 빈도 분석
+# ---------------------------------------------------------------------------
+
+
+def week_start(day: date) -> date:
+    """그 날짜가 속한 주의 월요일을 돌려줍니다(주간 묶음의 기준)."""
+    return day - timedelta(days=day.isoweekday() - 1)
+
+
+def week_label(monday: date) -> str:
+    """'2026-W15' 형태의 주차 이름을 만듭니다."""
+    iso_year, iso_week, _ = monday.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def collect_dates(rows: list[dict]) -> list[date]:
+    """게시물 행에서 날짜만 뽑아 정렬해 돌려줍니다."""
+    days: list[date] = []
+    for row in rows:
+        text = row.get("날짜")
+        if not text:
+            continue
+        try:
+            days.append(date.fromisoformat(text))
+        except ValueError:
+            continue
+    return sorted(days)
+
+
+def build_weekly_sheet(rows: list[dict]) -> list[list]:
+    """'주간 업로드' 시트 내용을 만듭니다.
+
+    보여주는 것
+    - 주 평균 업로드 횟수
+    - 가장 많이 올린 주 / 가장 적게 올린 주 (언제, 몇 건)
+    - 평균 업로드 주기(며칠에 한 번 올리는지)
+    - 주차별 업로드 수 전체 목록
+    """
+    days = collect_dates(rows)
+    if not days:
+        return [["주간 업로드 분석"], ["분석할 날짜 데이터가 없습니다."]]
+
+    first, last = days[0], days[-1]
+
+    # 게시물이 하나도 없는 주도 '0건인 주'로 포함해야 평균이 부풀지 않습니다.
+    counts = Counter(week_start(d) for d in days)
+    weeks: list[tuple[date, int]] = []
+    cursor = week_start(first)
+    final = week_start(last)
+    while cursor <= final:
+        weeks.append((cursor, counts.get(cursor, 0)))
+        cursor += timedelta(days=7)
+
+    avg_per_week = round(len(days) / len(weeks), 2)
+    busiest = max(weeks, key=lambda w: w[1])
+    quietest = min(weeks, key=lambda w: w[1])
+
+    # 평균 업로드 주기 = 전체 기간 / (게시물 수 - 1)
+    # 게시물이 1건뿐이면 '간격'이라는 개념이 없으므로 빈 칸으로 둡니다.
+    if len(days) > 1:
+        gaps = [(days[i + 1] - days[i]).days for i in range(len(days) - 1)]
+        avg_gap = round(statistics.fmean(gaps), 2)
+        median_gap = round(statistics.median(gaps), 2)
+    else:
+        avg_gap = ""
+        median_gap = ""
+
+    def week_range_text(monday: date) -> str:
+        return f"{monday.isoformat()} ~ {(monday + timedelta(days=6)).isoformat()}"
+
+    sheet: list[list] = [
+        ["주간 업로드 분석"],
+        [],
+        ["항목", "값", "비고"],
+        ["분석 기간", f"{first.isoformat()} ~ {last.isoformat()}", f"{(last - first).days + 1}일"],
+        ["전체 게시물 수", len(days), ""],
+        ["전체 주간 수", len(weeks), "게시물이 없는 주도 포함"],
+        ["주 평균 업로드", avg_per_week, "회/주"],
+        ["최다 업로드 주간", week_label(busiest[0]), f"{week_range_text(busiest[0])} — {busiest[1]}회"],
+        ["최저 업로드 주간", week_label(quietest[0]), f"{week_range_text(quietest[0])} — {quietest[1]}회"],
+        ["평균 업로드 주기", avg_gap, "일 (게시물 사이 평균 간격)"],
+        ["중앙값 업로드 주기", median_gap, "일 (극단값에 덜 흔들리는 값)"],
+        [],
+        ["주차별 상세"],
+        ["주차", "시작일(월)", "종료일(일)", "업로드 수"],
+    ]
+
+    # 최신 주가 위로 오도록 뒤집어서 넣습니다.
+    for monday, count in reversed(weeks):
+        sheet.append(
+            [
+                week_label(monday),
+                monday.isoformat(),
+                (monday + timedelta(days=6)).isoformat(),
+                count,
+            ]
+        )
+
+    return sheet
+
+
+# ---------------------------------------------------------------------------
+# 해시태그 분석
+# ---------------------------------------------------------------------------
+
+
+def extract_hashtags(text: str) -> list[str]:
+    """본문에서 해시태그를 뽑아냅니다.
+
+    '#' 뒤에 붙은 글자/숫자/밑줄을 하나의 해시태그로 봅니다.
+    파이썬의 \\w 는 한글도 글자로 인식하므로 '#국내여행' 같은 것도 잡힙니다.
+    """
+    if not text:
+        return []
+    return re.findall(r"#(\w+)", str(text))
+
+
+def build_hashtag_sheet(
+    rows: list[dict],
+    top_n: int = 5,
+    trend_days: int = DEFAULT_TREND_DAYS,
+) -> list[list]:
+    """'해시태그' 시트 내용을 만듭니다.
+
+    보여주는 것
+    - 가장 많이 쓴 해시태그 TOP N
+    - 전체 해시태그 사용 순위
+    - 최근 N일 vs 그 이전 N일 사용량 비교(요즘 뜨는 태그 찾기)
+    """
+    # 해시태그는 대소문자를 구분하지 않으므로 소문자로 묶어서 셉니다.
+    # 다만 화면에는 실제로 가장 많이 쓰인 표기를 그대로 보여줍니다.
+    total_counter: Counter = Counter()
+    display_forms: dict[str, Counter] = {}
+    posts_with_tag: Counter = Counter()
+    tagged_post_count = 0
+    dated_tags: list[tuple[date, set[str]]] = []
+
+    for row in rows:
+        tags = extract_hashtags(row.get("본문", ""))
+        if tags:
+            tagged_post_count += 1
+
+        keys_in_post = set()
+        for tag in tags:
+            key = tag.lower()
+            total_counter[key] += 1
+            display_forms.setdefault(key, Counter())[tag] += 1
+            keys_in_post.add(key)
+
+        for key in keys_in_post:
+            posts_with_tag[key] += 1
+
+        # 트렌드 계산용으로 '날짜 + 그 글에 쓰인 태그들'을 따로 모아둡니다.
+        text = row.get("날짜")
+        if text and keys_in_post:
+            try:
+                dated_tags.append((date.fromisoformat(text), keys_in_post))
+            except ValueError:
+                pass
+
+    if not total_counter:
+        return [["해시태그 분석"], ["본문에서 해시태그를 찾지 못했습니다."]]
+
+    def label(key: str) -> str:
+        """저장된 표기들 중 가장 많이 쓰인 형태로 보여줍니다."""
+        return "#" + display_forms[key].most_common(1)[0][0]
+
+    total_uses = sum(total_counter.values())
+    post_count = len(rows)
+
+    sheet: list[list] = [
+        ["해시태그 분석"],
+        [],
+        ["항목", "값", "비고"],
+        ["해시태그 종류 수", len(total_counter), ""],
+        ["총 사용 횟수", total_uses, ""],
+        ["해시태그를 쓴 게시물", tagged_post_count, f"전체 {post_count}건 중"],
+        [
+            "게시물당 평균 개수",
+            round(total_uses / post_count, 2) if post_count else "",
+            "전체 게시물 기준",
+        ],
+        [],
+        [f"가장 많이 쓴 해시태그 TOP {top_n}"],
+        ["순위", "해시태그", "사용 횟수", "사용 게시물 수", "사용 비율(%)"],
+    ]
+
+    for rank, (key, count) in enumerate(total_counter.most_common(top_n), start=1):
+        ratio = round(posts_with_tag[key] / post_count * 100, 1) if post_count else ""
+        sheet.append([rank, label(key), count, posts_with_tag[key], ratio])
+
+    # --- 트렌드: 최근 N일 vs 그 이전 N일 --------------------------------
+    if dated_tags:
+        latest = max(d for d, _ in dated_tags)
+        recent_from = latest - timedelta(days=trend_days - 1)
+        previous_from = recent_from - timedelta(days=trend_days)
+
+        recent_counter: Counter = Counter()
+        previous_counter: Counter = Counter()
+        recent_posts = 0
+        previous_posts = 0
+        for day, keys in dated_tags:
+            if day >= recent_from:
+                recent_counter.update(keys)
+                recent_posts += 1
+            elif day >= previous_from:
+                previous_counter.update(keys)
+                previous_posts += 1
+
+        earliest = min(d for d, _ in dated_tags)
+        span_days = (latest - earliest).days + 1
+        note = ""
+        if span_days < trend_days * 2:
+            note = (
+                f"※ 수집 기간이 {span_days}일이라 '이전 {trend_days}일' 구간이 "
+                f"온전하지 않습니다. 참고용으로만 보세요."
+            )
+
+        sheet += [
+            [],
+            [f"떠오르는 해시태그 (최근 {trend_days}일 vs 그 이전 {trend_days}일)"],
+            [f"최근 구간: {recent_from.isoformat()} ~ {latest.isoformat()}"],
+            [
+                f"이전 구간: {previous_from.isoformat()} ~ "
+                f"{(recent_from - timedelta(days=1)).isoformat()}"
+            ],
+        ]
+        if note:
+            sheet.append([note])
+        sheet.append(
+            [f"최근 게시물 {recent_posts}건 / 이전 게시물 {previous_posts}건 기준"]
+        )
+        sheet.append(
+            [
+                "해시태그",
+                f"최근 {trend_days}일",
+                "최근 사용률(%)",
+                f"이전 {trend_days}일",
+                "이전 사용률(%)",
+                "사용률 증감(%p)",
+            ]
+        )
+
+        def usage_rate(count: int, posts: int) -> float:
+            """그 구간의 게시물 중 몇 %에서 이 태그를 썼는지."""
+            return round(count / posts * 100, 1) if posts else 0.0
+
+        # 단순 사용 횟수로 비교하면, 최근에 게시물을 많이 올렸다는 이유만으로
+        # 모든 태그가 '증가'로 보입니다. 그래서 게시물 수 대비 '사용률'로 비교합니다.
+        candidates = set(recent_counter) | set(previous_counter)
+        scored = []
+        for key in candidates:
+            recent_rate = usage_rate(recent_counter[key], recent_posts)
+            previous_rate = usage_rate(previous_counter[key], previous_posts)
+            scored.append((recent_rate - previous_rate, recent_rate, key))
+        scored.sort(reverse=True)
+
+        for delta_rate, recent_rate, key in scored[:top_n]:
+            sheet.append(
+                [
+                    label(key),
+                    recent_counter[key],
+                    recent_rate,
+                    previous_counter[key],
+                    usage_rate(previous_counter[key], previous_posts),
+                    f"+{round(delta_rate, 1)}" if delta_rate > 0 else str(round(delta_rate, 1)),
+                ]
+            )
+
+    # --- 전체 순위 --------------------------------------------------------
+    sheet += [
+        [],
+        ["전체 해시태그 순위"],
+        ["순위", "해시태그", "사용 횟수", "사용 게시물 수", "사용 비율(%)"],
+    ]
+    for rank, (key, count) in enumerate(total_counter.most_common(), start=1):
+        ratio = round(posts_with_tag[key] / post_count * 100, 1) if post_count else ""
+        sheet.append([rank, label(key), count, posts_with_tag[key], ratio])
+
+    return sheet
+
+
 def parse_data(
     raw_posts: Iterable[dict],
     start_date: str | None = None,
     end_date: str | None = None,
     followers: int | None = None,
+    account: str | None = None,
 ) -> list[dict]:
     """원본 게시물 목록 → 최종 CSV 행 목록.
 
     1. 각 게시물을 공통 형태로 변환
-    2. code 기준 중복 제거
-    3. 시작/종료 날짜로 기간 필터
-    4. 참여율 계산 (팔로워 수를 아는 경우에만)
-    5. 날짜 내림차순(최신순) 정렬
+    2. account 를 주면 그 계정의 게시물만 남김(다른 계정 글 제외)
+    3. code 기준 중복 제거
+    4. 시작/종료 날짜로 기간 필터
+    5. 참여율 계산 (팔로워 수를 아는 경우에만)
+    6. 날짜 내림차순(최신순) 정렬
     """
+    target = account.lower() if account else None
+    foreign_count = 0
     seen_codes: set[str] = set()
     rows: list[dict] = []
 
@@ -666,44 +1057,55 @@ def parse_data(
         if not isinstance(post, dict):
             continue
 
+        # 2. 계정 필터 — 다른 계정의 게시물(추천 글 등)을 걸러냅니다.
+        #    주인을 알 수 없는 게시물은 여기서 거르지 않습니다(수집 단계에서 이미 처리).
+        if target:
+            owner = post_owner_username(post)
+            if owner is not None and owner != target:
+                foreign_count += 1
+                continue
+
         row = normalize_post(post)
         if row is None:
             continue
 
-        # 2. 중복 제거 — 같은 게시물이 여러 번 잡히는 일이 흔합니다.
+        # 3. 중복 제거 — 같은 게시물이 여러 번 잡히는 일이 흔합니다.
         code = row.pop("_code")
         if code in seen_codes:
             continue
         seen_codes.add(code)
 
-        # 3. 기간 필터 — 날짜 문자열이 YYYY-MM-DD 라 문자열 비교로도 정확합니다.
+        # 4. 기간 필터 — 날짜 문자열이 YYYY-MM-DD 라 문자열 비교로도 정확합니다.
         date = row["날짜"]
         if start_date and (not date or date < start_date):
             continue
         if end_date and (not date or date > end_date):
             continue
 
-        # 4. 참여율 계산 — 팔로워 수를 모르면 빈 칸으로 남습니다.
+        # 5. 참여율 계산 — 팔로워 수를 모르면 빈 칸으로 남습니다.
         row["참여율(%)"] = calc_engagement_rate(row["좋아요"], row["댓글"], followers)
 
         rows.append(row)
 
-    # 4. 최신순 정렬
+    if foreign_count:
+        print(f"[정보] @{target} 이외 계정의 게시물 {foreign_count}건을 제외했습니다.")
+
+    # 6. 최신순 정렬
     rows.sort(key=lambda r: r["날짜"], reverse=True)
     return rows
 
 
 # ---------------------------------------------------------------------------
-# 5단계: CSV로 저장
+# 5단계: 파일로 저장 (엑셀 여러 시트 또는 CSV 여러 개)
 # ---------------------------------------------------------------------------
 
 
 def build_output_path(account: str | None, explicit_out: str | None = None) -> str:
-    """저장할 CSV 파일 이름을 만듭니다.
+    """저장할 파일 이름을 만듭니다.
 
     --out 을 직접 주면 그 값을 그대로 쓰고,
-    안 주면 'result_계정명_YYMMDDHHMM.csv' 형태로 자동 생성합니다.
-      예) result_bmwmotorradkorea_2608101634.csv
+    안 주면 'result_계정명_YYMMDDHHMM.xlsx' 형태로 자동 생성합니다.
+      예) result_bmwmotorradkorea_2608101634.xlsx
 
     실행할 때마다 이름이 달라지므로
     - 엑셀로 이전 결과를 열어둔 채 다시 돌려도 충돌하지 않고
@@ -715,7 +1117,7 @@ def build_output_path(account: str | None, explicit_out: str | None = None) -> s
     # 파일 이름에 쓸 수 없는 글자(\ / : * ? " < > |)를 밑줄로 바꿉니다.
     safe_account = re.sub(r'[\\/:*?"<>|\s]', "_", account or "unknown")
     stamp = datetime.now().strftime("%y%m%d%H%M")  # 예: 2608101634
-    return f"result_{safe_account}_{stamp}.csv"
+    return f"result_{safe_account}_{stamp}.xlsx"
 
 
 def guess_account_from_posts(raw_posts: list[dict]) -> str | None:
@@ -736,33 +1138,120 @@ def guess_account_from_posts(raw_posts: list[dict]) -> str | None:
     return None
 
 
-def export_csv(rows: list[dict], output_path: str = "result.csv") -> None:
-    """결과를 CSV 파일로 저장합니다.
+def build_posts_sheet(rows: list[dict]) -> list[list]:
+    """'게시물' 시트 내용을 만듭니다(요약 통계 행 + 게시물 목록)."""
+    summary_rows = build_summary_rows(rows)
 
-    헤더 바로 아래에 요약 통계 행(평균/최고치/최저치/표준편차)을 먼저 쓰고,
-    그 다음에 게시물 행들을 씁니다.
+    sheet: list[list] = [list(CSV_FIELDNAMES)]
+    for row in summary_rows:
+        sheet.append([row[name] for name in CSV_FIELDNAMES])
+    if summary_rows:
+        # 요약과 실제 데이터 사이에 빈 줄을 넣어 눈으로 구분하기 쉽게 합니다.
+        sheet.append([""] * len(CSV_FIELDNAMES))
+    for row in rows:
+        sheet.append([row[name] for name in CSV_FIELDNAMES])
+    return sheet
+
+
+def build_all_sheets(
+    rows: list[dict],
+    top_n: int = 5,
+    trend_days: int = DEFAULT_TREND_DAYS,
+) -> dict[str, list[list]]:
+    """저장할 시트 3개를 모두 만듭니다."""
+    return {
+        SHEET_POSTS: build_posts_sheet(rows),
+        SHEET_WEEKLY: build_weekly_sheet(rows),
+        SHEET_HASHTAG: build_hashtag_sheet(rows, top_n=top_n, trend_days=trend_days),
+    }
+
+
+def permission_error_exit(path: str) -> SystemExit:
+    """파일이 열려 있어 저장에 실패했을 때 보여줄 안내를 만듭니다."""
+    return SystemExit(
+        f"[오류] '{path}' 파일에 쓸 수 없습니다.\n"
+        f"       이 파일을 엑셀 등 다른 프로그램에서 열어두고 있다면 닫은 뒤 다시 실행해주세요.\n"
+        f"       (또는 --out 옵션으로 다른 파일 이름을 지정하세요.)"
+    )
+
+
+def export_xlsx(sheets: dict[str, list[list]], output_path: str) -> None:
+    """여러 시트를 가진 엑셀 파일 하나로 저장합니다. (openpyxl 필요)"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)  # 기본으로 생기는 빈 시트를 제거
+
+    for name, data in sheets.items():
+        worksheet = workbook.create_sheet(title=name)
+        for row in data:
+            worksheet.append(row)
+
+        # 첫 줄(제목/헤더)을 굵게 해서 눈에 띄게 합니다.
+        if data:
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+
+        # 내용 길이에 맞춰 열 너비를 적당히 넓힙니다.
+        for column_cells in worksheet.columns:
+            longest = max(
+                (len(str(cell.value)) for cell in column_cells if cell.value is not None),
+                default=0,
+            )
+            letter = column_cells[0].column_letter
+            worksheet.column_dimensions[letter].width = min(max(longest + 2, 10), 60)
+
+    try:
+        workbook.save(output_path)
+    except PermissionError:
+        raise permission_error_exit(output_path)
+
+
+def export_csv_files(sheets: dict[str, list[list]], output_path: str) -> list[str]:
+    """엑셀을 쓸 수 없을 때, 시트마다 CSV 파일을 따로 만듭니다.
 
     encoding='utf-8-sig' 는 'UTF-8 with BOM' 입니다.
     이걸 써야 윈도우 엑셀에서 한글이 깨지지 않습니다.
     """
-    summary_rows = build_summary_rows(rows)
+    base, _ = os.path.splitext(output_path)
+    written: list[str] = []
 
-    try:
-        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
-            writer.writeheader()
-            writer.writerows(summary_rows)
-            if summary_rows:
-                # 요약과 실제 데이터 사이에 빈 줄을 넣어 눈으로 구분하기 쉽게 합니다.
-                writer.writerow({name: "" for name in CSV_FIELDNAMES})
-            writer.writerows(rows)
-    except PermissionError:
-        # 윈도우에서 해당 CSV를 엑셀로 열어둔 경우가 대부분입니다.
-        raise SystemExit(
-            f"[오류] '{output_path}' 파일에 쓸 수 없습니다.\n"
-            f"       이 파일을 엑셀 등 다른 프로그램에서 열어두고 있다면 닫은 뒤 다시 실행해주세요.\n"
-            f"       (또는 --out 옵션으로 다른 파일 이름을 지정하세요.)"
-        )
+    for name, data in sheets.items():
+        # 첫 번째 시트(게시물)는 기존 이름 그대로, 나머지는 뒤에 시트 이름을 붙입니다.
+        if name == SHEET_POSTS:
+            path = f"{base}.csv"
+        else:
+            path = f"{base}_{name.replace(' ', '')}.csv"
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerows(data)
+        except PermissionError:
+            raise permission_error_exit(path)
+        written.append(path)
+
+    return written
+
+
+def export_result(sheets: dict[str, list[list]], output_path: str) -> list[str]:
+    """확장자에 맞춰 저장합니다.
+
+    - .xlsx  → 시트 3개짜리 엑셀 파일 하나
+    - .csv   → 시트마다 CSV 파일 하나씩
+    openpyxl 이 없으면 CSV 방식으로 자동 전환합니다.
+    """
+    if output_path.lower().endswith(".xlsx"):
+        try:
+            export_xlsx(sheets, output_path)
+            return [output_path]
+        except ImportError:
+            print(
+                "[주의] openpyxl 이 없어 엑셀 파일을 만들 수 없습니다. CSV 파일로 나눠 저장합니다.\n"
+                "       엑셀 한 파일로 받으려면: pip install openpyxl"
+            )
+
+    return export_csv_files(sheets, output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +1270,7 @@ def validate_date(value: str | None, label: str) -> str | None:
     return value
 
 
-def report(rows: list[dict], raw_count: int, output_path: str) -> None:
+def report(rows: list[dict], raw_count: int, written_paths: list[str]) -> None:
     """작업 결과를 사람이 읽기 좋게 출력합니다."""
     if not rows:
         print(
@@ -789,8 +1278,14 @@ def report(rows: list[dict], raw_count: int, output_path: str) -> None:
             "기간(--start/--end)을 넓혀 보거나 로그인 세션을 확인해 주세요."
         )
         return
+
+    if len(written_paths) == 1:
+        where = f"'{written_paths[0]}'"
+    else:
+        where = "\n  - " + "\n  - ".join(written_paths)
+
     print(
-        f"수집 {raw_count}건 중 고유 {len(rows)}건 → '{output_path}' 저장 완료 "
+        f"수집 {raw_count}건 중 고유 {len(rows)}건 → {where} 저장 완료 "
         f"(기간: {rows[-1]['날짜']} ~ {rows[0]['날짜']})"
     )
 
@@ -799,7 +1294,7 @@ def build_parser() -> argparse.ArgumentParser:
     """CLI 명령과 옵션을 정의합니다."""
     parser = argparse.ArgumentParser(
         prog="instagram_crawler.py",
-        description="인스타그램 게시물 참여 지표를 수집해 result.csv 로 저장합니다.",
+        description="인스타그램 게시물 참여 지표를 수집해 엑셀(시트 3개)로 저장합니다.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "예시\n"
@@ -830,7 +1325,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_json.add_argument(
         "--out",
         default=None,
-        help="저장할 CSV 경로 (기본: result_계정명_YYMMDDHHMM.csv 로 자동 생성)",
+        help=(
+            "저장할 파일 경로 (기본: result_계정명_YYMMDDHHMM.xlsx 로 자동 생성). "
+            ".csv 로 끝나면 시트별로 CSV 파일을 따로 만듭니다."
+        ),
+    )
+    p_json.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="해시태그 TOP N 개수 (기본: 5)",
+    )
+    p_json.add_argument(
+        "--trend-days",
+        type=int,
+        default=DEFAULT_TREND_DAYS,
+        help=f"해시태그 트렌드 비교 기간(일). 최근 N일 vs 그 이전 N일 (기본: {DEFAULT_TREND_DAYS})",
     )
 
     # --- login : 세션 저장 --------------------------------------------------
@@ -853,12 +1363,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_crawl.add_argument(
         "--out",
         default=None,
-        help="저장할 CSV 경로 (기본: result_계정명_YYMMDDHHMM.csv 로 자동 생성)",
+        help=(
+            "저장할 파일 경로 (기본: result_계정명_YYMMDDHHMM.xlsx 로 자동 생성). "
+            ".csv 로 끝나면 시트별로 CSV 파일을 따로 만듭니다."
+        ),
+    )
+    p_crawl.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="해시태그 TOP N 개수 (기본: 5)",
+    )
+    p_crawl.add_argument(
+        "--trend-days",
+        type=int,
+        default=DEFAULT_TREND_DAYS,
+        help=f"해시태그 트렌드 비교 기간(일). 최근 N일 vs 그 이전 N일 (기본: {DEFAULT_TREND_DAYS})",
     )
     p_crawl.add_argument(
         "--session-file", default=DEFAULT_SESSION_FILE, help=f"사용할 세션 파일 (기본: {DEFAULT_SESSION_FILE})"
     )
     p_crawl.add_argument("--show-browser", action="store_true", help="브라우저 창을 보이게 실행합니다.")
+    p_crawl.add_argument(
+        "--no-owner-filter",
+        action="store_true",
+        help=(
+            "계정 확인 없이 화면에 보인 게시물을 모두 수집합니다. "
+            "(주의: 인스타그램이 끼워넣는 '추천 게시물' 등 남의 계정 글이 섞입니다)"
+        ),
+    )
     p_crawl.add_argument(
         "--delay", type=float, default=2.0, help="스크롤 사이 대기 시간(초). 차단이 잦으면 늘리세요. (기본: 2.0)"
     )
@@ -911,6 +1444,7 @@ def main(argv: list[str] | None = None) -> int:
                 session_file=args.session_file,
                 headless=not args.show_browser,
                 delay=args.delay,
+                owner_filter=not args.no_owner_filter,
             )
             if args.save_json:
                 with open(args.save_json, "w", encoding="utf-8") as f:
@@ -944,10 +1478,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # 2~4단계: 정리 → 5단계: 저장
-    rows = parse_data(raw_posts, start_date=start_date, end_date=end_date, followers=followers)
+    # crawl 은 대상 계정이 확실하므로 정리 단계에서 한 번 더 걸러냅니다(이중 안전장치).
+    account_filter = username if args.command == "crawl" and not args.no_owner_filter else None
+    rows = parse_data(
+        raw_posts,
+        start_date=start_date,
+        end_date=end_date,
+        followers=followers,
+        account=account_filter,
+    )
     output_path = build_output_path(username, args.out)
-    export_csv(rows, output_path)
-    report(rows, len(raw_posts), output_path)
+    sheets = build_all_sheets(rows, top_n=args.top, trend_days=args.trend_days)
+    written_paths = export_result(sheets, output_path)
+    report(rows, len(raw_posts), written_paths)
     return 0
 
 
