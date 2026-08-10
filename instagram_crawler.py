@@ -36,6 +36,7 @@ import glob
 import json
 import os
 import re
+import statistics
 import sys
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -44,8 +45,12 @@ from typing import Any, Iterable
 # 설정값(상수)
 # ---------------------------------------------------------------------------
 
-# CSV에 저장할 컬럼 순서. 요구사항 스키마와 정확히 동일해야 합니다.
-CSV_FIELDNAMES = ["날짜", "타입", "좋아요", "댓글", "공유", "저장", "본문", "링크"]
+# CSV에 저장할 컬럼 순서.
+# 맨 앞 '구분' 은 요약 행(평균/최고치/...)을 표시하는 칸이며, 게시물 행에서는 비어 있습니다.
+CSV_FIELDNAMES = ["구분", "날짜", "타입", "좋아요", "댓글", "참여율(%)", "본문", "링크"]
+
+# 요약 통계를 계산할 숫자 컬럼들
+SUMMARY_METRICS = ["좋아요", "댓글", "참여율(%)"]
 
 # 브라우저 로그인 정보(쿠키)를 저장해 둘 파일 이름.
 DEFAULT_SESSION_FILE = "session.json"
@@ -336,18 +341,22 @@ def fetch_posts_live(
     headless: bool = True,
     delay: float = 2.0,
     max_idle_scrolls: int = 5,
-) -> list[dict]:
+) -> tuple[list[dict], int | None]:
     """Playwright 브라우저로 계정 페이지를 열고 스크롤하며 게시물을 수집합니다.
 
     동작 원리
     - 인스타그램 화면은 스크롤할 때마다 서버에 추가 데이터를 요청(XHR)합니다.
     - 그 응답(JSON)을 가로채서 게시물 정보를 그대로 확보합니다.
       → HTML 태그를 파싱하는 것보다 훨씬 안정적입니다.
+
+    돌려주는 값: (게시물 목록, 팔로워 수 또는 None)
+    팔로워 수는 참여율 계산에 쓰이며, 프로필 응답에서 자동으로 찾습니다.
     """
     from playwright.sync_api import sync_playwright
 
     collected: list[dict] = []
     seen_codes: set[str] = set()
+    follower_box: list[int] = []  # 콜백 안에서 값을 담아두기 위한 그릇
 
     def handle_response(response) -> None:
         """네트워크 응답이 올 때마다 호출되는 함수(콜백)."""
@@ -359,6 +368,13 @@ def fetch_posts_live(
             body = response.json()
         except Exception:
             return  # JSON이 아니면 무시
+
+        # 팔로워 수는 프로필 응답에 한 번만 실려 오므로, 처음 찾은 값을 기억해 둡니다.
+        if not follower_box:
+            followers = find_follower_count(body)
+            if followers:
+                follower_box.append(followers)
+                print(f"[정보] 팔로워 수 확인: {followers:,}명 (참여율 계산에 사용)")
 
         found: list[dict] = []
         collect_posts_from_json_blob(body, found)
@@ -450,7 +466,7 @@ def fetch_posts_live(
             "비공개 계정이라면 로그인 세션이 그 계정을 팔로우하는 상태인지 확인해주세요."
         )
 
-    return collected
+    return collected, (follower_box[0] if follower_box else None)
 
 
 # ---------------------------------------------------------------------------
@@ -522,18 +538,13 @@ def normalize_post(post: dict) -> dict | None:
     if comment_count is None:
         comment_count = dig(post, "edge_media_preview_comment", "count")
 
-    # 공유/저장 수는 '본인 계정의 인사이트'에서만 제공됩니다.
-    # 공개 데이터에는 없는 경우가 대부분이라, 없으면 빈 값으로 둡니다.
-    share_count = get_first(post, "share_count", "reshare_count", "shareCount")
-    save_count = get_first(post, "save_count", "saved_count", "saveCount")
-
     return {
+        "구분": "",  # 게시물 행은 비워두고, 요약 행에만 '평균' 등이 들어갑니다.
         "날짜": date,
         "타입": normalize_media_format(post),
         "좋아요": to_int(like_count),
         "댓글": to_int(comment_count),
-        "공유": to_int(share_count),
-        "저장": to_int(save_count),
+        "참여율(%)": "",  # 팔로워 수를 알아야 계산되므로 나중에 채웁니다.
         "본문": normalize_caption(post),
         "링크": f"https://instagram.com/p/{code}/",
         # 아래 값은 중복 제거용으로만 쓰고, CSV에는 쓰지 않습니다.
@@ -546,17 +557,107 @@ def normalize_post(post: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def find_follower_count(blob: Any, depth: int = 0) -> int | None:
+    """데이터 어딘가에 들어있는 팔로워 수를 찾아냅니다.
+
+    참여율을 계산하려면 팔로워 수가 필요한데, 수집 도구마다 위치와 이름이 다릅니다.
+    그래서 흔한 이름들을 재귀적으로 찾습니다.
+    """
+    if depth > 8:  # 너무 깊이 들어가지 않도록 제한
+        return None
+
+    if isinstance(blob, dict):
+        # 1) 숫자로 바로 들어있는 경우
+        for key in ("follower_count", "followersCount", "followers_count", "followers"):
+            value = blob.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+
+        # 2) 웹(GraphQL) 구조: edge_followed_by.count
+        count = dig(blob, "edge_followed_by", "count")
+        if isinstance(count, (int, float)) and count > 0:
+            return int(count)
+
+        for value in blob.values():
+            found = find_follower_count(value, depth + 1)
+            if found:
+                return found
+
+    elif isinstance(blob, list):
+        for value in blob[:20]:  # 앞쪽 몇 건만 확인해도 충분합니다.
+            found = find_follower_count(value, depth + 1)
+            if found:
+                return found
+
+    return None
+
+
+def calc_engagement_rate(like_count: Any, comment_count: Any, followers: int | None) -> Any:
+    """참여율(%) = (좋아요 + 댓글) / 팔로워 수 × 100
+
+    팔로워 수를 모르면 계산할 수 없으므로 빈 문자열을 돌려줍니다.
+    """
+    if not followers or followers <= 0:
+        return ""
+    likes = like_count if isinstance(like_count, int) else 0
+    comments = comment_count if isinstance(comment_count, int) else 0
+    return round((likes + comments) / followers * 100, 2)
+
+
+def build_summary_rows(rows: list[dict]) -> list[dict]:
+    """게시물 행들을 바탕으로 맨 위에 붙일 요약 통계 행을 만듭니다.
+
+    만드는 행: 평균 / 최고치 / 최저치 / 표준편차
+    표준편차는 '성과가 얼마나 들쭉날쭉한지'(consistency)를 보여줍니다.
+    값이 클수록 게시물별 편차가 크다는 뜻입니다.
+    """
+    if not rows:
+        return []
+
+    # 컬럼별로 숫자인 값만 모읍니다(빈 칸은 통계에서 제외).
+    values_by_metric: dict[str, list[float]] = {}
+    for metric in SUMMARY_METRICS:
+        numbers = [r[metric] for r in rows if isinstance(r[metric], (int, float))]
+        if numbers:
+            values_by_metric[metric] = [float(n) for n in numbers]
+
+    if not values_by_metric:
+        return []
+
+    def make_row(label: str, func) -> dict:
+        """label 이름의 요약 행 하나를 만듭니다."""
+        row = {name: "" for name in CSV_FIELDNAMES}
+        row["구분"] = label
+        for metric, numbers in values_by_metric.items():
+            # 참여율은 소수 둘째 자리, 좋아요·댓글은 첫째 자리까지 표시합니다.
+            digits = 2 if metric == "참여율(%)" else 1
+            value = round(func(numbers), digits)
+            # 1234.0 처럼 소수점이 의미 없는 값은 1234 로 깔끔하게 표시합니다.
+            row[metric] = int(value) if float(value).is_integer() else value
+        return row
+
+    return [
+        make_row("평균", statistics.fmean),
+        make_row("최고치", max),
+        make_row("최저치", min),
+        # pstdev(모집단 표준편차)는 값이 1개일 때도 오류 없이 0을 돌려줍니다.
+        make_row("표준편차", statistics.pstdev),
+    ]
+
+
 def parse_data(
     raw_posts: Iterable[dict],
     start_date: str | None = None,
     end_date: str | None = None,
+    followers: int | None = None,
 ) -> list[dict]:
     """원본 게시물 목록 → 최종 CSV 행 목록.
 
     1. 각 게시물을 공통 형태로 변환
     2. code 기준 중복 제거
     3. 시작/종료 날짜로 기간 필터
-    4. 날짜 내림차순(최신순) 정렬
+    4. 참여율 계산 (팔로워 수를 아는 경우에만)
+    5. 날짜 내림차순(최신순) 정렬
     """
     seen_codes: set[str] = set()
     rows: list[dict] = []
@@ -581,6 +682,9 @@ def parse_data(
             continue
         if end_date and (not date or date > end_date):
             continue
+
+        # 4. 참여율 계산 — 팔로워 수를 모르면 빈 칸으로 남습니다.
+        row["참여율(%)"] = calc_engagement_rate(row["좋아요"], row["댓글"], followers)
 
         rows.append(row)
 
@@ -635,13 +739,22 @@ def guess_account_from_posts(raw_posts: list[dict]) -> str | None:
 def export_csv(rows: list[dict], output_path: str = "result.csv") -> None:
     """결과를 CSV 파일로 저장합니다.
 
+    헤더 바로 아래에 요약 통계 행(평균/최고치/최저치/표준편차)을 먼저 쓰고,
+    그 다음에 게시물 행들을 씁니다.
+
     encoding='utf-8-sig' 는 'UTF-8 with BOM' 입니다.
     이걸 써야 윈도우 엑셀에서 한글이 깨지지 않습니다.
     """
+    summary_rows = build_summary_rows(rows)
+
     try:
         with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
             writer.writeheader()
+            writer.writerows(summary_rows)
+            if summary_rows:
+                # 요약과 실제 데이터 사이에 빈 줄을 넣어 눈으로 구분하기 쉽게 합니다.
+                writer.writerow({name: "" for name in CSV_FIELDNAMES})
             writer.writerows(rows)
     except PermissionError:
         # 윈도우에서 해당 CSV를 엑셀로 열어둔 경우가 대부분입니다.
@@ -710,6 +823,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_json.add_argument("--start", help="시작 날짜 YYYY-MM-DD")
     p_json.add_argument("--end", help="종료 날짜 YYYY-MM-DD")
     p_json.add_argument(
+        "--followers",
+        type=int,
+        help="팔로워 수 (참여율 계산용). 데이터에서 자동으로 찾지 못할 때 직접 지정하세요.",
+    )
+    p_json.add_argument(
         "--out",
         default=None,
         help="저장할 CSV 경로 (기본: result_계정명_YYMMDDHHMM.csv 로 자동 생성)",
@@ -727,6 +845,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_crawl.add_argument("--start", help="시작 날짜 YYYY-MM-DD")
     p_crawl.add_argument("--end", help="종료 날짜 YYYY-MM-DD")
     p_crawl.add_argument("--limit", type=int, default=200, help="최대 수집 게시물 수 (기본: 200)")
+    p_crawl.add_argument(
+        "--followers",
+        type=int,
+        help="팔로워 수 (참여율 계산용). 지정하면 자동 인식값 대신 이 값을 씁니다.",
+    )
     p_crawl.add_argument(
         "--out",
         default=None,
@@ -771,14 +894,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # 1단계: 원본 데이터 확보
     username: str | None = None
+    followers: int | None = None
     try:
         if args.command == "from-json":
             raw_posts = fetch_posts_from_json(args.json_path)
             # 파일 이름에 넣을 계정명을 데이터 안에서 찾아봅니다.
             username = guess_account_from_posts(raw_posts)
+            # 참여율 계산에 쓸 팔로워 수도 데이터 안에서 찾아봅니다.
+            followers = find_follower_count(raw_posts)
         else:  # crawl
             username = extract_username(args.account)
-            raw_posts = fetch_posts_live(
+            raw_posts, followers = fetch_posts_live(
                 username=username,
                 limit=args.limit,
                 start_date=start_date,
@@ -808,8 +934,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[오류] 수집 중 문제가 발생했습니다: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
+    # --followers 를 직접 지정했으면 자동 인식값보다 우선합니다.
+    if getattr(args, "followers", None):
+        followers = args.followers
+    if not followers:
+        print(
+            "[주의] 팔로워 수를 찾지 못해 참여율을 계산하지 않습니다(빈 칸으로 남습니다).\n"
+            "       --followers 12345 처럼 직접 지정하면 계산됩니다."
+        )
+
     # 2~4단계: 정리 → 5단계: 저장
-    rows = parse_data(raw_posts, start_date=start_date, end_date=end_date)
+    rows = parse_data(raw_posts, start_date=start_date, end_date=end_date, followers=followers)
     output_path = build_output_path(username, args.out)
     export_csv(rows, output_path)
     report(rows, len(raw_posts), output_path)
