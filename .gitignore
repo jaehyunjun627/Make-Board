@@ -1,16 +1,16 @@
-﻿# Eclipse 설정 파일
-.classpath
-.project
-.settings/
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
 
-# 컴파일된 파일
-bin/
-target/
-build/
-*.class
+# 로그인 세션 (쿠키가 들어있으므로 절대 커밋하지 마세요)
+session.json
 
-# 서버 설정
-Servers/
+# 수집 결과물
+result.csv
+*.csv
+dataset_*.json
 
 # 기타
 .DS_Store
