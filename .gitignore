@@ -10,6 +10,7 @@ session.json
 # 수집 결과물
 result.csv
 *.csv
+*.xlsx
 dataset_*.json
 
 # 기타
