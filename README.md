@@ -35,16 +35,18 @@ result_bmwmotorradkorea_2608101634.xlsx   ← 2026-08-10 16:34에 bmwmotorradkor
 
 아래 8개 컬럼으로 만들어지고, **맨 위에 요약 통계 4줄**이 먼저 나옵니다.
 
-| 구분 | 날짜 | 타입 | 좋아요 | 댓글 | 참여율(%) | 본문 | 링크 |
-|------|------|------|--------|------|-----------|------|------|
-| 평균 | | | 703.5 | 24.8 | 1.46 | | |
-| 최고치 | | | 1234 | 56 | 2.58 | | |
-| 최저치 | | | 100 | 2 | 0.2 | | |
-| 표준편차 | | | 436.9 | 20.9 | 0.92 | | |
+| 구분 | 업로드일 | 좋아요 | 댓글 | 참여율(%) | 타입 | 본문 | 링크 |
+|------|----------|--------|------|-----------|------|------|------|
+| 평균 | | 703.5 | 24.8 | 1.46 | | | |
+| 최고치 | | 1234 | 56 | 2.58 | | | |
+| 최저치 | | 100 | 2 | 0.2 | | | |
+| 표준편차 | | 436.9 | 20.9 | 0.92 | | | |
 | | | | | | | | |
-| | 2026-08-09 | image | 1234 | 56 | 2.58 | 오늘의 라이딩 코스 ... | https://instagram.com/p/ABC123/ |
-| | 2026-08-05 | video | 980 | 31 | 2.02 | 신형 R1300GS 첫 시승기 ... | https://instagram.com/p/DEF456/ |
+| | 2026-08-09 | 1234 | 56 | 2.58 | 이미지 | 오늘의 라이딩 코스 ... | https://instagram.com/p/ABC123/ |
+| | 2026-08-05 | 980 | 31 | 2.02 | 릴스 | 신형 R1300GS 첫 시승기 ... | https://instagram.com/p/DEF456/ |
 
+- **`타입`** 은 `이미지` / `릴스` / `캐러셀` 로 표시됩니다.
+  여러 장짜리 글은 영상이 섞여 있어도 `캐러셀` 로 분류합니다.
 - **`구분`** 칸은 요약 행에만 값이 들어갑니다. 게시물 행은 비어 있습니다.
 - 요약과 게시물 사이에 **빈 줄**이 하나 들어가 눈으로 구분하기 쉽습니다.
 - 인코딩은 **UTF-8 with BOM(`utf-8-sig`)** 이라 윈도우 엑셀에서 한글이 깨지지 않습니다.
@@ -245,8 +247,11 @@ python instagram_crawler.py login
 # 기본 (최대 200건)
 python instagram_crawler.py crawl https://www.instagram.com/bmwmotorradkorea/
 
-# 기간 지정
-python instagram_crawler.py crawl https://www.instagram.com/bmwmotorradkorea/ --start 2026-01-01 --end 2026-08-10
+# 올해 1월 1일부터 오늘까지
+python instagram_crawler.py crawl bmwmotorradkorea --start 2026-01-01 --limit 500
+
+# 작년(2025년) 자료만
+python instagram_crawler.py crawl bmwmotorradkorea --start 2025-01-01 --end 2025-12-31 --limit 500
 
 # 더 많이, 더 천천히 (차단이 걱정될 때)
 python instagram_crawler.py crawl bmwmotorradkorea --limit 500 --delay 4
@@ -259,6 +264,19 @@ python instagram_crawler.py crawl bmwmotorradkorea --save-json raw.json
 ```
 
 계정은 URL(`https://www.instagram.com/이름/`)이든 아이디(`이름`)든 상관없습니다.
+
+#### 과거 자료를 뽑을 때 (`--start` / `--end`)
+
+- **`--limit` 은 "기간 안에 들어오는 게시물" 기준으로 셉니다.**
+  작년 자료를 뽑을 때, 올해 게시물이 한도를 다 잡아먹지 않도록 하기 위함입니다.
+- 다만 인스타그램은 **최신순으로만** 내려주므로, 과거로 갈수록 그 사이 게시물을
+  전부 지나가야 합니다. 오래 걸릴 수 있으니 `--delay` 는 넉넉히 주세요.
+- `--start` 를 주면 그보다 오래된 게시물이 3건 나온 시점에 자동으로 멈춥니다.
+  (고정 게시물이 위쪽에 섞이는 경우를 감안해 여유를 둡니다.)
+- 진행 상황은 이렇게 표시됩니다.
+  ```
+  [진행] 기간 내 42건 / 전체 확인 310건
+  ```
 
 ---
 

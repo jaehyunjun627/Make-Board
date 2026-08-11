@@ -56,7 +56,7 @@ from typing import Any, Iterable
 
 # CSV에 저장할 컬럼 순서.
 # 맨 앞 '구분' 은 요약 행(평균/최고치/...)을 표시하는 칸이며, 게시물 행에서는 비어 있습니다.
-CSV_FIELDNAMES = ["구분", "날짜", "타입", "좋아요", "댓글", "참여율(%)", "본문", "링크"]
+CSV_FIELDNAMES = ["구분", "업로드일", "좋아요", "댓글", "참여율(%)", "타입", "본문", "링크"]
 
 # 요약 통계를 계산할 숫자 컬럼들
 SUMMARY_METRICS = ["좋아요", "댓글", "참여율(%)"]
@@ -72,25 +72,33 @@ DEFAULT_TREND_DAYS = 90
 # 브라우저 로그인 정보(쿠키)를 저장해 둘 파일 이름.
 DEFAULT_SESSION_FILE = "session.json"
 
-# 인스타그램 내부 API가 쓰는 media_type 숫자 → 사람이 읽는 이름
-MEDIA_TYPE_NUMBER = {1: "image", 2: "video", 8: "album"}
+# 결과에 표시할 게시물 종류 이름(한글)
+TYPE_IMAGE = "이미지"
+TYPE_REELS = "릴스"
+TYPE_CAROUSEL = "캐러셀"
 
-# 웹(GraphQL)에서 쓰는 타입 이름 → 사람이 읽는 이름
+# 인스타그램 내부 API가 쓰는 media_type 숫자 → 표시 이름
+MEDIA_TYPE_NUMBER = {1: TYPE_IMAGE, 2: TYPE_REELS, 8: TYPE_CAROUSEL}
+
+# 웹(GraphQL)·기타 도구에서 쓰는 타입 이름 → 표시 이름
 MEDIA_TYPE_NAME = {
-    "graphimage": "image",
-    "xdtgraphimage": "image",
-    "image": "image",
-    "graphvideo": "video",
-    "xdtgraphvideo": "video",
-    "video": "video",
-    "clips": "video",
-    "reel": "video",
-    "graphsidecar": "album",
-    "xdtgraphsidecar": "album",
-    "sidecar": "album",
-    "carousel": "album",
-    "carousel_container": "album",
-    "album": "album",
+    "graphimage": TYPE_IMAGE,
+    "xdtgraphimage": TYPE_IMAGE,
+    "image": TYPE_IMAGE,
+    "photo": TYPE_IMAGE,
+    "graphvideo": TYPE_REELS,
+    "xdtgraphvideo": TYPE_REELS,
+    "video": TYPE_REELS,
+    "clips": TYPE_REELS,
+    "reel": TYPE_REELS,
+    "reels": TYPE_REELS,
+    "igtv": TYPE_REELS,
+    "graphsidecar": TYPE_CAROUSEL,
+    "xdtgraphsidecar": TYPE_CAROUSEL,
+    "sidecar": TYPE_CAROUSEL,
+    "carousel": TYPE_CAROUSEL,
+    "carousel_container": TYPE_CAROUSEL,
+    "album": TYPE_CAROUSEL,
 }
 
 
@@ -383,6 +391,7 @@ def fetch_posts_live(
     username: str,
     limit: int = 200,
     start_date: str | None = None,
+    end_date: str | None = None,
     session_file: str = DEFAULT_SESSION_FILE,
     headless: bool = True,
     delay: float = 2.0,
@@ -497,13 +506,32 @@ def fetch_posts_live(
                 "'python instagram_crawler.py login' 을 다시 실행해 세션을 새로 만들어주세요."
             )
 
+        def post_date(post: dict) -> str:
+            """수집한 원본 게시물에서 업로드 날짜(YYYY-MM-DD)를 꺼냅니다."""
+            return parse_date(
+                get_first(post, "taken_at_date", "timestamp", "taken_at", "taken_at_timestamp")
+            )
+
+        def in_range(post: dict) -> bool:
+            """--start ~ --end 안에 드는 게시물인지 확인합니다."""
+            day = post_date(post)
+            if not day:
+                return True  # 날짜를 모르면 일단 포함시켜 두고 나중에 거릅니다.
+            if start_date and day < start_date:
+                return False
+            if end_date and day > end_date:
+                return False
+            return True
+
         idle_scrolls = 0        # 스크롤해도 새 게시물이 안 늘어난 횟수
-        old_post_hits = 0       # start_date 보다 오래된 게시물을 만난 횟수
         previous_count = 0
 
         while True:
             # (a) 목표 개수를 채웠으면 종료
-            if len(collected) >= limit:
+            #     기간을 지정했다면 '기간 안에 드는 게시물'만 셉니다.
+            #     그래야 작년 자료를 뽑을 때 올해 게시물이 한도를 다 잡아먹지 않습니다.
+            in_range_count = sum(1 for post in collected if in_range(post))
+            if in_range_count >= limit:
                 print(f"[정보] 목표 개수({limit}건) 도달, 수집을 마칩니다.")
                 break
 
@@ -511,8 +539,7 @@ def fetch_posts_live(
             #     (고정 게시물이 위쪽에 섞일 수 있어 여유를 두고 3건까지 봅니다)
             if start_date:
                 old_post_hits = sum(
-                    1 for post in collected if (parse_date(get_first(post, "taken_at_date",
-                    "timestamp", "taken_at", "taken_at_timestamp")) or "9999") < start_date
+                    1 for post in collected if (post_date(post) or "9999") < start_date
                 )
                 if old_post_hits >= 3:
                     print(f"[정보] {start_date} 이전 게시물에 도달, 수집을 마칩니다.")
@@ -536,7 +563,12 @@ def fetch_posts_live(
                     break
             else:
                 idle_scrolls = 0
-                print(f"[진행] 현재까지 {len(collected)}건 수집")
+                if start_date or end_date:
+                    print(
+                        f"[진행] 기간 내 {in_range_count}건 / 전체 확인 {len(collected)}건"
+                    )
+                else:
+                    print(f"[진행] 현재까지 {len(collected)}건 수집")
 
             previous_count = len(collected)
 
@@ -579,22 +611,23 @@ def fetch_posts_live(
 
 
 def normalize_media_format(post: dict) -> str:
-    """게시물 종류를 image / video / album 중 하나로 정리합니다."""
-    # 1) 이미 사람이 읽는 형태로 들어있는 경우
+    """게시물 종류를 이미지 / 릴스 / 캐러셀 중 하나로 정리합니다."""
+    # 1) 캐러셀(여러 장) 데이터가 있으면 그것이 가장 확실한 단서입니다.
+    #    캐러셀 안에 영상이 섞여 있으면 타입이 video 로 오기도 하므로 먼저 확인합니다.
+    if post.get("carousel_media") or post.get("edge_sidecar_to_children"):
+        return TYPE_CAROUSEL
+
+    # 2) 이미 이름 형태로 들어있는 경우
     raw = get_first(post, "media_format", "type", "product_type", "__typename", "typename")
     if raw:
         key = str(raw).strip().lower()
         if key in MEDIA_TYPE_NAME:
             return MEDIA_TYPE_NAME[key]
 
-    # 2) 인스타그램 내부 API의 숫자 코드인 경우 (1=사진, 2=영상, 8=여러 장)
+    # 3) 인스타그램 내부 API의 숫자 코드인 경우 (1=사진, 2=영상, 8=여러 장)
     media_type = post.get("media_type")
     if isinstance(media_type, int) and media_type in MEDIA_TYPE_NUMBER:
         return MEDIA_TYPE_NUMBER[media_type]
-
-    # 3) 캐러셀(여러 장) 데이터가 들어있으면 album
-    if post.get("carousel_media") or post.get("edge_sidecar_to_children"):
-        return "album"
 
     # 어떤 힌트도 없으면 원본 값을 그대로(문자열) 남깁니다.
     return str(raw) if raw else ""
@@ -644,7 +677,7 @@ def normalize_post(post: dict) -> dict | None:
 
     return {
         "구분": "",  # 게시물 행은 비워두고, 요약 행에만 '평균' 등이 들어갑니다.
-        "날짜": date,
+        "업로드일": date,
         "타입": normalize_media_format(post),
         "좋아요": to_int(like_count),
         "댓글": to_int(comment_count),
@@ -769,7 +802,7 @@ def collect_dates(rows: list[dict]) -> list[date]:
     """게시물 행에서 날짜만 뽑아 정렬해 돌려줍니다."""
     days: list[date] = []
     for row in rows:
-        text = row.get("날짜")
+        text = row.get("업로드일")
         if not text:
             continue
         try:
@@ -903,7 +936,7 @@ def build_hashtag_sheet(
             posts_with_tag[key] += 1
 
         # 트렌드 계산용으로 '날짜 + 그 글에 쓰인 태그들'을 따로 모아둡니다.
-        text = row.get("날짜")
+        text = row.get("업로드일")
         if text and keys_in_post:
             try:
                 dated_tags.append((date.fromisoformat(text), keys_in_post))
@@ -1076,7 +1109,7 @@ def parse_data(
         seen_codes.add(code)
 
         # 4. 기간 필터 — 날짜 문자열이 YYYY-MM-DD 라 문자열 비교로도 정확합니다.
-        date = row["날짜"]
+        date = row["업로드일"]
         if start_date and (not date or date < start_date):
             continue
         if end_date and (not date or date > end_date):
@@ -1091,7 +1124,7 @@ def parse_data(
         print(f"[정보] @{target} 이외 계정의 게시물 {foreign_count}건을 제외했습니다.")
 
     # 6. 최신순 정렬
-    rows.sort(key=lambda r: r["날짜"], reverse=True)
+    rows.sort(key=lambda r: r["업로드일"], reverse=True)
     return rows
 
 
@@ -1286,7 +1319,7 @@ def report(rows: list[dict], raw_count: int, written_paths: list[str]) -> None:
 
     print(
         f"수집 {raw_count}건 중 고유 {len(rows)}건 → {where} 저장 완료 "
-        f"(기간: {rows[-1]['날짜']} ~ {rows[0]['날짜']})"
+        f"(기간: {rows[-1]['업로드일']} ~ {rows[0]['업로드일']})"
     )
 
 
@@ -1441,6 +1474,7 @@ def main(argv: list[str] | None = None) -> int:
                 username=username,
                 limit=args.limit,
                 start_date=start_date,
+                end_date=end_date,
                 session_file=args.session_file,
                 headless=not args.show_browser,
                 delay=args.delay,
