@@ -164,32 +164,46 @@ def parse_date(value: Any) -> str:
     - "2026-08-10T05:52:38.000Z" 같은 ISO 문자열
     - "2026-08-10" 같이 이미 날짜만 있는 문자열
     - 1754800000 같은 유닉스 타임스탬프(초)
+
+    ※ 시간대에 관하여 (중요)
+      인스타그램이 주는 시각은 UTC 기준입니다. 이걸 그대로 쓰면
+      한국시간 새벽 0~9시에 올라온 글이 '하루 전'으로 기록됩니다.
+      (예: 한국 9월 7일 오전 8시 = UTC 9월 6일 밤 11시)
+      그래서 이 컴퓨터의 시간대(한국이면 한국시간)로 바꿔서 날짜를 정합니다.
+      화면에서 보는 업로드 날짜와 결과 파일의 날짜가 같아집니다.
     """
     if value in (None, ""):
         return ""
 
-    # 1) 숫자(유닉스 타임스탬프)인 경우
+    # 1) 숫자(유닉스 타임스탬프)인 경우 → 이 컴퓨터의 시간대로 변환
     if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
         seconds = int(value)
         # 밀리초 단위로 들어오는 경우가 있어 자리수로 판단해 보정합니다.
         if seconds > 10_000_000_000:
             seconds = seconds // 1000
         try:
-            return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d")
+            return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d")
         except (OverflowError, OSError, ValueError):
             return ""
 
-    # 2) 문자열인 경우: 앞 10글자가 YYYY-MM-DD 형태면 그대로 사용
     text = str(value)
+
+    # 2) ISO 문자열: 시간대 정보가 붙어 있으면 이 컴퓨터의 시간대로 옮깁니다.
+    #    ("2026-09-06T23:00:00Z" → 한국이면 2026-09-07)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().strftime("%Y-%m-%d")
+        return parsed.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # 3) 그 밖의 형태는 앞 10글자가 YYYY-MM-DD 인지 보고 그대로 씁니다.
     match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
     if match:
         return match.group(1)
 
-    # 3) 그 밖의 형태는 파이썬에게 해석을 맡겨 봅니다.
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    except ValueError:
-        return ""
+    return ""
 
 
 def clean_text(value: Any) -> str:
@@ -517,6 +531,16 @@ def fetch_posts_live(
             raise RuntimeError(
                 "로그인이 필요합니다. 세션이 없거나 만료된 것으로 보입니다. "
                 "'python instagram_crawler.py login' 을 다시 실행해 세션을 새로 만들어주세요."
+            )
+
+        # 아이디 오타나 사라진 계정을 '게시물 0건'과 구분합니다.
+        # 이걸 확인하지 않으면 없는 계정도 '정상 처리, 0건'으로 보고돼
+        # 결과 파일만 텅 빈 채로 남습니다.
+        if profile_missing(page):
+            browser.close()
+            raise RuntimeError(
+                f"@{username} 계정 페이지를 찾을 수 없습니다. "
+                "아이디 철자를 확인해 주세요(비공개로 전환되었거나 삭제되었을 수도 있습니다)."
             )
 
         def post_date(post: dict) -> str:
@@ -2627,6 +2651,17 @@ def save_daily_workbook(path: str, rows: list[dict], snapshot_days: set[str]) ->
     for day in sorted(snapshot_days):
         header.extend(snapshot_columns(day))
 
+    # 사용자가 엑셀에서 직접 추가한 컬럼(메모 등)을 잃지 않도록 뒤에 붙입니다.
+    # 시트를 통째로 다시 쓰기 때문에, 여기서 챙기지 않으면 다음 실행 때 사라집니다.
+    known = set(header) | {"_code"}
+    extra_columns: list[str] = []
+    for row in rows:
+        for name in row:
+            if name not in known:
+                known.add(name)
+                extra_columns.append(name)
+    header.extend(extra_columns)
+
     workbook = Workbook()
     workbook.remove(workbook.active)
     sheet = workbook.create_sheet(title=SHEET_DAILY)
@@ -2952,6 +2987,19 @@ def run_daily_crawl(
 
             if stats["snapshots_written"]:
                 snapshot_days.add(snapshot)
+
+            # 적을 게 하나도 없으면 파일을 만들지 않습니다.
+            # 헤더만 있는 빈 엑셀이 생기면 "수집은 됐는데 글이 없다"는 건지
+            # "뭔가 잘못됐다"는 건지 구분할 수 없어 혼란스럽습니다.
+            if not rows:
+                write_daily_log(
+                    log_path,
+                    "INFO",
+                    f"  Posts discovered: 0 — {window_start}~{snapshot} 사이에 올라온 글이 없습니다."
+                    " (파일을 만들지 않았습니다)",
+                )
+                succeeded.append(account_name)
+                continue
 
             save_daily_workbook(path, rows, snapshot_days)
 
