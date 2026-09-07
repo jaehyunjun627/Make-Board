@@ -24,8 +24,13 @@ instagram_crawler.py
    python instagram_crawler.py crawl https://www.instagram.com/bmwmotorradkorea/ \
        --start 2026-01-01 --end 2026-08-10
 
+3) 경쟁사 팔로워 추적하기 (게시물은 수집하지 않습니다)
+   python instagram_crawler.py track-followers   # accounts.csv 계정들의 팔로워 수 기록
+   python instagram_crawler.py follower-report    # 쌓인 기록 → 엑셀 리포트
+
 프로그램 구조
 -------------------------------------------------
+[게시물 수집]
 - fetch_posts_from_json() : JSON 파일에서 게시물 원본(raw)을 읽어옴
 - fetch_posts_live()      : Playwright 브라우저로 인스타그램에서 직접 수집
 - normalize_post()        : 서로 다른 필드 이름을 하나의 공통 형태로 정리
@@ -33,6 +38,13 @@ instagram_crawler.py
 - build_weekly_sheet()    : 주간 업로드 빈도 분석
 - build_hashtag_sheet()   : 해시태그 순위 + 트렌드 분석
 - export_result()         : 엑셀(시트 3개) 또는 CSV 여러 개로 저장
+
+[경쟁사 팔로워 추적] — 게시물을 수집하지 않는 가벼운 기능
+- fetch_follower_count_live() : 프로필을 열어 팔로워 수만 확인(스크롤 없음)
+- load_accounts()             : accounts.csv 에서 추적할 계정 목록 읽기
+- track_followers()           : 팔로워 수 기록 + 중복 방지 + 계정별 로그
+- build_follower_report()     : 기록 → 시트 3개짜리 엑셀 리포트
+
 - main()                  : 커맨드라인(CLI) 진입점
 """
 
@@ -46,9 +58,10 @@ import os
 import re
 import statistics
 import sys
+import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 # ---------------------------------------------------------------------------
 # 설정값(상수)
@@ -1287,6 +1300,1129 @@ def export_result(sheets: dict[str, list[list]], output_path: str) -> list[str]:
     return export_csv_files(sheets, output_path)
 
 
+# ===========================================================================
+# 경쟁사 팔로워 추적기 (Competitor Follower Tracker)
+# ===========================================================================
+#
+# 여러 경쟁사 계정의 "팔로워 수"만 날짜별로 기록해 두는 기능입니다.
+# 위쪽 게시물 수집 기능(from-json / crawl)과는 완전히 분리되어 있어서,
+# 기존 기능에는 아무 영향을 주지 않습니다.
+#
+# 중요 — 이 기능은 게시물을 전혀 수집하지 않습니다.
+#   프로필 화면을 열어 팔로워 수만 확인하고 곧바로 닫습니다.
+#   스크롤(=게시물 페이지네이션)을 아예 하지 않으므로
+#   매일 자동으로 돌려도 result_*.xlsx 같은 결과 파일이 쌓이지 않습니다.
+#
+# 이 섹션의 구성
+#   1) 설정값        : 파일 이름, 컬럼 이름 등
+#   2) 도우미 함수    : CSV 읽기/쓰기, 숫자 표기 해석
+#   3) 팔로워 수집    : fetch_follower_count_live()  ← 스크롤하지 않는 가벼운 수집
+#   4) 계정 목록      : accounts.csv 읽기
+#   5) 히스토리 관리  : followers_history.csv 읽기/쓰기, 중복 방지
+#   6) 추적 실행      : track_followers()
+#   7) 리포트 생성    : build_follower_report()
+
+
+# ---------------------------------------------------------------------------
+# 1) 설정값
+# ---------------------------------------------------------------------------
+
+# 추적할 경쟁사 목록 파일 (없으면 예시와 함께 자동으로 만들어 줍니다)
+DEFAULT_ACCOUNTS_FILE = "accounts.csv"
+
+# 날짜별 팔로워 수가 쌓이는 파일. 절대 덮어쓰지 않고 뒤에 덧붙이기만 합니다.
+DEFAULT_HISTORY_FILE = "followers_history.csv"
+
+# 계정별 성공/실패 기록이 남는 파일
+DEFAULT_TRACKER_LOG_FILE = "tracker_log.csv"
+
+# follower-report 명령이 만드는 엑셀 파일
+DEFAULT_REPORT_FILE = "follower_report.xlsx"
+
+ACCOUNTS_FIELDNAMES = ["account_name", "username"]
+
+HISTORY_FIELDNAMES = [
+    "date",               # 추적한 날짜 (YYYY-MM-DD)
+    "timestamp",          # 실제 수집 시각 (YYYY-MM-DD HH:MM:SS)
+    "account_name",       # accounts.csv 에 적어둔 이름 (예: 혼다 모터사이클 코리아)
+    "username",           # 인스타그램 아이디
+    "followers",          # 팔로워 수
+    "daily_change",       # 직전 기록일 대비 증감 (명)
+    "daily_change_rate",  # 직전 기록일 대비 증감률 (%)
+]
+
+TRACKER_LOG_FIELDNAMES = ["timestamp", "account_name", "username", "status", "message"]
+
+# 계정 하나당 팔로워 수를 기다리는 최대 시간(초)
+DEFAULT_FOLLOWER_TIMEOUT = 30.0
+
+# 계정과 계정 사이 쉬는 시간(초). 너무 빠르게 연속 요청하면 인스타그램이 제한할 수 있습니다.
+DEFAULT_TRACK_DELAY = 1.5
+
+# 인스타그램 아이디로 쓸 수 있는 글자: 영문/숫자/마침표/밑줄, 최대 30자
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+# follower-report 엑셀의 시트 이름
+SHEET_FOLLOWER_HISTORY = "일별 기록"
+SHEET_ACCOUNT_SUMMARY = "계정 요약"
+SHEET_MONTHLY_GROWTH = "월별 성장"
+
+# accounts.csv 를 처음 만들 때 넣어줄 예시 줄
+SAMPLE_ACCOUNTS = [
+    ["혼다 모터사이클 코리아", "honda_motorcycle_korea"],
+    ["BMW 모토라드 코리아", "bmwmotorradkorea"],
+    ["로얄엔필드 코리아", "royalenfield_korea"],
+    ["할리데이비슨 코리아", "harleydavidsonkorea"],
+    ["트라이엄프 코리아", "triumphmotorcycles_kr"],
+]
+
+
+class TrackerError(Exception):
+    """팔로워 추적 중 '사용자에게 설명할 수 있는' 오류.
+
+    이 오류는 프로그램 전체를 멈추지 않고, 해당 계정만 실패로 기록한 뒤
+    다음 계정으로 넘어가는 데 쓰입니다.
+    """
+
+
+# ---------------------------------------------------------------------------
+# 2) 도우미 함수 (CSV 읽고 쓰기)
+# ---------------------------------------------------------------------------
+
+
+def ensure_csv_file(path: str, fieldnames: list[str], sample_rows: list[list] | None = None) -> bool:
+    """CSV 파일이 없으면 헤더(+예시 줄)를 넣어 새로 만듭니다.
+
+    새로 만들었으면 True, 이미 있어서 아무것도 하지 않았으면 False 를 돌려줍니다.
+    이미 있는 파일은 절대 건드리지 않습니다(기존 기록 보존).
+
+    encoding='utf-8-sig' 는 'UTF-8 with BOM' 입니다.
+    이걸 써야 윈도우 엑셀에서 한글이 깨지지 않습니다.
+    """
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return False
+    try:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(fieldnames)
+            for row in sample_rows or []:
+                writer.writerow(row)
+    except PermissionError:
+        raise permission_error_exit(path)
+    return True
+
+
+def read_csv_dicts(path: str) -> list[dict]:
+    """CSV 파일을 '한 줄 = 딕셔너리' 목록으로 읽습니다. 파일이 없으면 빈 목록."""
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
+def append_csv_row(path: str, fieldnames: list[str], row: dict) -> None:
+    """CSV 파일 맨 뒤에 한 줄만 덧붙입니다(기존 내용은 그대로 둡니다).
+
+    파일을 처음 만들 때만 utf-8-sig(BOM)를 쓰고, 덧붙일 때는 utf-8 을 씁니다.
+    BOM 은 파일 맨 앞에 딱 한 번만 있어야 하는 표시라서,
+    덧붙일 때마다 BOM 을 또 쓰면 엑셀에서 이상한 글자가 보입니다.
+    """
+    ensure_csv_file(path, fieldnames)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
+    except PermissionError:
+        raise permission_error_exit(path)
+
+
+def parse_count_text(text: Any) -> int | None:
+    """화면에 보이는 숫자 표기를 정수로 바꿉니다.
+
+    '52,340' → 52340 / '1.2K' → 1200 / '3.4M' → 3400000 / '1.2만' → 12000
+    해석할 수 없으면 None 을 돌려줍니다(0 을 돌려주지 않는 점이 중요합니다).
+    """
+    if text in (None, ""):
+        return None
+
+    cleaned = str(text).strip().replace(",", "").replace(" ", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([KkMmBb만억천]?)", cleaned)
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    multipliers = {
+        "": 1,
+        "k": 1_000,
+        "m": 1_000_000,
+        "b": 1_000_000_000,
+        "천": 1_000,
+        "만": 10_000,
+        "억": 100_000_000,
+    }
+    suffix = match.group(2)
+    factor = multipliers.get(suffix if suffix in ("천", "만", "억") else suffix.lower(), 1)
+    value = int(number * factor)
+    return value if value > 0 else None
+
+
+def format_change(change: Any, rate: Any) -> str:
+    """증감을 '+240 (+0.46%)' 같은 읽기 좋은 문자열로 만듭니다."""
+    if change in (None, ""):
+        return "이전 기록이 없어 비교할 수 없습니다."
+    sign = "+" if isinstance(change, int) and change > 0 else ""
+    if rate in (None, ""):
+        return f"{sign}{change:,}"
+    rate_sign = "+" if isinstance(rate, (int, float)) and rate > 0 else ""
+    return f"{sign}{change:,} ({rate_sign}{rate}%)"
+
+
+# ---------------------------------------------------------------------------
+# 3) 팔로워 수집 (게시물은 수집하지 않는 가벼운 방식)
+# ---------------------------------------------------------------------------
+
+
+def find_follower_count_for_user(blob: Any, username: str, depth: int = 0) -> int | None:
+    """'조회 대상 계정의' 팔로워 수만 찾아냅니다.
+
+    기존 find_follower_count() 는 데이터 어디에 있든 팔로워 수를 찾아줍니다.
+    그런데 인스타그램 응답에는 '추천 계정' 정보가 함께 실려 오는 경우가 있어서,
+    그대로 쓰면 엉뚱한 계정의 팔로워 수를 가져올 위험이 있습니다.
+
+    그래서 여기서는 먼저 username 이 일치하는 부분(=대상 계정 정보 덩어리)을 찾고,
+    그 안에서만 기존 find_follower_count() 를 돌립니다.
+    """
+    if depth > 10:
+        return None
+
+    target = username.lower()
+
+    if isinstance(blob, dict):
+        name = blob.get("username")
+        if isinstance(name, str) and name.lower() == target:
+            # 대상 계정 덩어리를 찾았습니다. 그 안에서 팔로워 수를 꺼냅니다.
+            found = find_follower_count(blob)
+            if found:
+                return found
+        for value in blob.values():
+            found = find_follower_count_for_user(value, username, depth + 1)
+            if found:
+                return found
+
+    elif isinstance(blob, list):
+        for value in blob[:50]:
+            found = find_follower_count_for_user(value, username, depth + 1)
+            if found:
+                return found
+
+    return None
+
+
+def has_followers_link(page, username: str) -> bool:
+    """프로필 화면에 '팔로워 N명' 링크가 실제로 있는지 확인합니다.
+
+    이 링크가 없다면 프로필 화면이 제대로 열리지 않은 것입니다.
+    (없는 계정이거나, 로그인 화면이거나, 아직 로딩 중)
+    """
+    target = username.lower()
+    try:
+        return page.query_selector(f'a[href*="/{target}/followers"]') is not None
+    except Exception:
+        return False
+
+
+def profile_missing(page) -> bool:
+    """'없는 계정' 화면인지 확인합니다(아이디 오타를 정확히 구분하기 위해서)."""
+    messages = (
+        "페이지를 사용할 수 없습니다",
+        "이 페이지는 사용할 수 없습니다",
+        "Sorry, this page isn't available",
+        "Sorry, this page isn",
+        "링크가 잘못되었거나",
+    )
+    for message in messages:
+        try:
+            if page.locator(f"text={message}").count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def read_follower_count_from_dom(page, username: str) -> tuple[int | None, str]:
+    """네트워크 응답에서 못 찾았을 때, 화면(HTML)에서 팔로워 수를 읽어봅니다.
+
+    돌려주는 값: (팔로워 수 또는 None, 어디서 찾았는지)
+
+    ★ 반드시 '이 계정의 팔로워 링크' 안에서만 숫자를 읽습니다. ★
+      예전에는 마지막 수단으로 'header span[title]'(헤더의 아무 숫자)까지 봤는데,
+      그러다 프로필 헤더의 '게시물 수'를 팔로워 수로 착각해
+      게시물 9개짜리 계정이 '팔로워 9명'으로 기록되는 일이 있었습니다.
+      실패하는 것보다 틀린 값을 기록하는 게 훨씬 나쁘므로, 느슨한 탐색은 없앴습니다.
+
+    화면에는 '1.2만' 처럼 줄여 보이지만, 그 옆 title 속성에는
+    정확한 숫자(52,340)가 들어 있는 경우가 많아 title 을 먼저 봅니다.
+    """
+    target = username.lower()
+    selectors = [
+        f'a[href="/{target}/followers/"] span[title]',
+        f'a[href*="/{target}/followers"] span[title]',
+        f'a[href="/{target}/followers/"] span',
+        f'a[href*="/{target}/followers"] span',
+        f'a[href*="/{target}/followers"]',
+    ]
+    for selector in selectors:
+        try:
+            element = page.query_selector(selector)
+        except Exception:
+            continue
+        if element is None:
+            continue
+
+        value = parse_count_text(element.get_attribute("title"))
+        if value:
+            return value, "화면-팔로워링크title"
+
+        try:
+            value = parse_count_text(element.inner_text())
+        except Exception:
+            value = None
+        if value:
+            return value, "화면-팔로워링크"
+
+    # 마지막 수단: 페이지 정보(meta 태그)에 "52,340 Followers, ..." 형태로 들어 있습니다.
+    # 여기서도 반드시 '팔로워/Followers' 라는 단어 바로 옆의 숫자만 읽습니다.
+    try:
+        content = page.get_attribute('meta[property="og:description"]', "content")
+    except Exception:
+        content = None
+
+    if content:
+        for pattern, source in (
+            (r"([\d.,]+\s*[KkMmBb]?)\s*(?:Followers|followers)", "페이지정보-영문"),
+            (r"팔로워\s*([\d.,]+\s*[KkMmBb만억천]?)", "페이지정보-한글"),
+        ):
+            match = re.search(pattern, content)
+            if match:
+                value = parse_count_text(match.group(1))
+                if value:
+                    return value, source
+
+    return None, ""
+
+
+def open_tracker_context(browser, session_file: str):
+    """저장해 둔 로그인 세션으로 브라우저 컨텍스트를 엽니다.
+
+    세션 파일이 아예 없으면 여기서 바로 멈춥니다.
+    (로그인 없이 진행하면 팔로워 수를 못 찾고 0 처럼 잘못 기록될 수 있기 때문입니다)
+    """
+    if not os.path.exists(session_file):
+        raise TrackerError(
+            f"로그인 세션 파일('{session_file}')이 없습니다. "
+            "먼저 'python instagram_crawler.py login' 을 실행해 주세요."
+        )
+
+    context = browser.new_context(storage_state=session_file)
+
+    # 이미지·동영상·폰트는 팔로워 수와 상관이 없으므로 아예 내려받지 않습니다.
+    # 계정 10~30개를 도는 속도가 눈에 띄게 빨라집니다.
+    def block_heavy_requests(route) -> None:
+        try:
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:
+            pass
+
+    try:
+        context.route("**/*", block_heavy_requests)
+    except Exception:
+        pass  # 차단에 실패해도 수집 자체에는 문제가 없습니다.
+
+    return context
+
+
+def read_follower_count_on_page(
+    page,
+    username: str,
+    timeout: float = DEFAULT_FOLLOWER_TIMEOUT,
+) -> tuple[int, str]:
+    """이미 열려 있는 탭으로 프로필에 들어가 팔로워 수'만' 읽어옵니다.
+
+    동작 순서
+      1. 프로필 주소로 이동
+      2. 인스타그램이 보내는 JSON 응답을 엿보며 팔로워 수를 찾음
+      3. 못 찾으면 화면(HTML)의 '팔로워 링크'에서 찾아봄
+      4. 찾는 즉시 종료 (스크롤은 하지 않습니다 = 게시물을 불러오지 않습니다)
+
+    돌려주는 값: (팔로워 수, 어디서 찾았는지)
+    어디서 찾았는지를 함께 남기는 이유는, 나중에 값이 이상할 때
+    '어느 경로로 읽은 숫자인지' 바로 알 수 있게 하기 위해서입니다.
+
+    실패하면 TrackerError 를 냅니다. 절대 0 을 돌려주지 않습니다.
+    """
+    found: list[int] = []
+    source_box: list[str] = []
+
+    def handle_response(response) -> None:
+        """네트워크 응답이 올 때마다 호출되는 함수(콜백)."""
+        if found:
+            return
+        url = response.url
+        if not any(part in url for part in ("/api/v1/users/", "/graphql", "/api/graphql")):
+            return
+        try:
+            body = response.json()
+        except Exception:
+            return  # JSON 이 아니면 무시
+        count = find_follower_count_for_user(body, username)
+        if count:
+            found.append(count)
+            source_box.append("응답데이터")
+
+    page.on("response", handle_response)
+    try:
+        profile_url = f"https://www.instagram.com/{username}/"
+        try:
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+        except Exception as e:
+            raise TrackerError(f"프로필을 열지 못했습니다: {type(e).__name__}")
+
+        page.wait_for_timeout(700)
+
+        # 로그인 화면이나 보안 확인 화면으로 튕겼는지 확인합니다.
+        if "/accounts/login" in page.url or "/challenge" in page.url:
+            raise TrackerError(
+                "로그인 세션이 만료된 것 같습니다. "
+                "'python instagram_crawler.py login' 을 다시 실행해 주세요."
+            )
+
+        # 없는 계정인지(오타 등) 확인합니다.
+        try:
+            title = (page.title() or "").lower()
+        except Exception:
+            title = ""
+        if "page not found" in title or "페이지를 사용할 수 없" in title:
+            raise TrackerError(f"@{username} 계정을 찾을 수 없습니다. 아이디 철자를 확인해 주세요.")
+
+        # 팔로워 수가 잡힐 때까지 잠깐씩 기다립니다(최대 timeout 초).
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if found:
+                break
+            dom_value, dom_source = read_follower_count_from_dom(page, username)
+            if dom_value:
+                found.append(dom_value)
+                source_box.append(dom_source)
+                break
+            page.wait_for_timeout(400)
+
+        # 아직도 못 찾았다면, 왜 못 찾았는지를 최대한 정확히 구분해 둡니다.
+        # (원인마다 해야 할 조치가 완전히 다르기 때문입니다)
+        if not found:
+            if profile_missing(page):
+                raise TrackerError(
+                    f"@{username} 계정을 찾을 수 없습니다. 아이디 철자를 확인해 주세요."
+                )
+            if not has_followers_link(page, username):
+                raise TrackerError(
+                    "프로필 화면이 열리지 않았습니다. "
+                    "아이디가 틀렸거나, 로그인 세션이 만료됐을 수 있습니다. "
+                    "--show-browser 로 실행하면 화면을 직접 확인할 수 있습니다."
+                )
+    finally:
+        # 콜백을 떼어내지 않으면 다음 계정에서도 계속 호출됩니다.
+        try:
+            page.remove_listener("response", handle_response)
+        except Exception:
+            pass
+
+    if not found:
+        raise TrackerError(
+            "프로필은 열렸지만 팔로워 수를 읽지 못했습니다. "
+            "(비공개 계정이거나 화면 구조가 바뀌었을 수 있습니다)"
+        )
+
+    return found[0], (source_box[0] if source_box else "알 수 없음")
+
+
+def fetch_follower_count_live(
+    username: str,
+    session_file: str = DEFAULT_SESSION_FILE,
+    headless: bool = True,
+    timeout: float = DEFAULT_FOLLOWER_TIMEOUT,
+) -> int:
+    """계정 하나의 현재 팔로워 수를 가져옵니다(브라우저를 열고 닫는 단독 실행용).
+
+    fetch_posts_live() 와 달리 스크롤하지 않고, 게시물도 수집하지 않습니다.
+    팔로워 수를 찾는 즉시 브라우저를 닫습니다.
+
+    실패하면 TrackerError 를 냅니다(0 을 돌려주지 않습니다).
+    """
+    from playwright.sync_api import sync_playwright  # 필요할 때만 불러옵니다.
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        try:
+            context = open_tracker_context(browser, session_file)
+            page = context.new_page()
+            try:
+                count, _source = read_follower_count_on_page(page, username, timeout=timeout)
+                return count
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+        finally:
+            browser.close()
+
+
+def fetch_follower_counts_live(
+    usernames: list[str],
+    session_file: str = DEFAULT_SESSION_FILE,
+    headless: bool = True,
+    timeout: float = DEFAULT_FOLLOWER_TIMEOUT,
+    delay: float = DEFAULT_TRACK_DELAY,
+) -> Iterator[tuple[str, int | None, str | None, str]]:
+    """여러 계정의 팔로워 수를 '브라우저 하나로' 이어서 확인합니다.
+
+    계정마다 브라우저를 새로 켜면 계정당 2~3초가 그냥 버려집니다.
+    30개를 돌린다면 1분 이상 차이가 나므로, 창 하나를 재사용합니다.
+
+    계정마다 (아이디, 팔로워 수 또는 None, 오류 메시지 또는 None, 값을 읽은 경로)
+    를 하나씩 돌려줍니다. 한 계정이 실패해도 다음 계정으로 계속 진행합니다.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        try:
+            context = open_tracker_context(browser, session_file)
+            for index, username in enumerate(usernames):
+                if index and delay > 0:
+                    time.sleep(delay)  # 너무 빠른 연속 요청을 피합니다.
+
+                page = None
+                try:
+                    page = context.new_page()
+                    count, source = read_follower_count_on_page(page, username, timeout)
+                    yield username, count, None, source
+                except TrackerError as e:
+                    yield username, None, str(e), ""
+                except Exception as e:  # 예상 못 한 오류도 그 계정만 실패 처리합니다.
+                    yield username, None, f"{type(e).__name__}: {e}", ""
+                finally:
+                    if page is not None:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+        finally:
+            browser.close()
+
+
+# ---------------------------------------------------------------------------
+# 4) 계정 목록 읽기 (accounts.csv)
+# ---------------------------------------------------------------------------
+
+
+def load_accounts(path: str = DEFAULT_ACCOUNTS_FILE) -> list[dict]:
+    """accounts.csv 에서 추적할 계정 목록을 읽습니다.
+
+    - 파일이 없으면 예시와 함께 새로 만들어 줍니다.
+    - 빈 줄과 '#' 로 시작하는 줄은 건너뜁니다.
+    - 아이디(bmwmotorradkorea) 든 주소(https://www.instagram.com/bmwmotorradkorea/) 든
+      모두 인식합니다(기존 extract_username() 재사용).
+    - 이상한 줄은 건너뛰고 안내만 출력합니다(전체를 멈추지 않습니다).
+
+    돌려주는 값: [{"account_name": 표시이름, "username": 아이디}, ...]
+    """
+    if not os.path.exists(path):
+        ensure_csv_file(path, ACCOUNTS_FIELDNAMES, SAMPLE_ACCOUNTS)
+        print(
+            f"[정보] '{path}' 파일이 없어 예시 계정과 함께 새로 만들었습니다.\n"
+            f"       메모장이나 엑셀로 열어 추적할 계정으로 바꾼 뒤 다시 실행해 주세요."
+        )
+
+    accounts: list[dict] = []
+    header_checked = False
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for line_no, raw_cells in enumerate(csv.reader(f), start=1):
+            cells = [str(c).strip() for c in raw_cells]
+
+            if not any(cells):
+                continue  # 빈 줄 무시
+            if cells[0].startswith("#"):
+                continue  # 메모 줄 무시
+
+            # 첫 번째 내용 줄이 헤더('account_name,username')면 건너뜁니다.
+            if not header_checked:
+                header_checked = True
+                lowered = [c.lower() for c in cells]
+                if "username" in lowered or "account_name" in lowered:
+                    continue
+
+            if len(cells) == 1:
+                display_name, account_input = "", cells[0]
+            else:
+                display_name, account_input = cells[0], cells[1]
+
+            # 이름만 적고 아이디를 비워둔 경우를 구제합니다.
+            if not account_input:
+                account_input, display_name = display_name, ""
+
+            try:
+                username = extract_username(account_input).strip().lower()
+            except ValueError as e:
+                print(f"[주의] {path} {line_no}번째 줄을 건너뜁니다 — {e}")
+                continue
+
+            if not USERNAME_PATTERN.match(username):
+                print(
+                    f"[주의] {path} {line_no}번째 줄을 건너뜁니다 — "
+                    f"인스타그램 아이디 형식이 아닙니다: '{account_input}'"
+                )
+                continue
+
+            accounts.append({"account_name": display_name or username, "username": username})
+
+    # 같은 계정을 두 번 적어두었다면 한 번만 추적합니다.
+    unique: dict[str, dict] = {}
+    for account in accounts:
+        unique.setdefault(account["username"], account)
+    return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# 5) 히스토리 관리 (followers_history.csv)
+# ---------------------------------------------------------------------------
+
+
+def load_history(path: str = DEFAULT_HISTORY_FILE) -> list[dict]:
+    """followers_history.csv 를 읽어 기록 목록을 돌려줍니다.
+
+    파일이 없으면 빈 목록을 돌려주고, 깨진 줄은 조용히 건너뜁니다.
+    """
+    records: list[dict] = []
+    for row in read_csv_dicts(path):
+        day = str(row.get("date") or "").strip()
+        username = str(row.get("username") or "").strip().lower()
+        followers = to_int(row.get("followers"))
+        if not day or not username or followers == "":
+            continue
+        records.append(
+            {
+                "date": day,
+                "timestamp": str(row.get("timestamp") or "").strip(),
+                "account_name": str(row.get("account_name") or "").strip(),
+                "username": username,
+                "followers": int(followers),
+            }
+        )
+    return records
+
+
+def group_history_by_username(records: list[dict]) -> dict[str, list[dict]]:
+    """기록을 계정별로 묶고, 각 계정 안에서는 오래된 순으로 정렬합니다."""
+    grouped: dict[str, list[dict]] = {}
+    for record in records:
+        grouped.setdefault(record["username"], []).append(record)
+    for rows in grouped.values():
+        rows.sort(key=lambda r: (r["date"], r["timestamp"]))
+    return grouped
+
+
+def already_tracked_on(records: list[dict], day: str) -> bool:
+    """그 계정이 해당 날짜에 이미 기록되어 있는지 확인합니다(중복 방지의 핵심)."""
+    return any(record["date"] == day for record in records)
+
+
+def find_previous_record(records: list[dict], day: str) -> dict | None:
+    """해당 날짜보다 '이전에' 기록된 것 중 가장 최근 기록을 찾습니다.
+
+    같은 날 여러 번 기록된 경우(--force)에도 '전날까지의 마지막 기록'과 비교하므로
+    증감이 0 으로 뭉개지지 않습니다.
+    """
+    earlier = [record for record in records if record["date"] < day]
+    return earlier[-1] if earlier else None
+
+
+def calc_follower_change(current: int, previous: int | None) -> tuple[Any, Any]:
+    """직전 기록 대비 증감과 증감률(%)을 계산합니다.
+
+    daily_change      = 현재 팔로워 - 이전 팔로워
+    daily_change_rate = (현재 - 이전) / 이전 × 100   (소수 둘째 자리 반올림)
+
+    비교할 이전 기록이 없으면 둘 다 빈 칸으로 둡니다(0 이 아닙니다).
+    """
+    if previous is None or previous <= 0:
+        return "", ""
+    change = current - previous
+    return change, round(change / previous * 100, 2)
+
+
+def append_history_record(
+    history_file: str,
+    day: str,
+    stamp: str,
+    account_name: str,
+    username: str,
+    followers: int,
+    change: Any,
+    change_rate: Any,
+) -> None:
+    """followers_history.csv 맨 뒤에 기록 한 줄을 덧붙입니다(덮어쓰지 않습니다)."""
+    append_csv_row(
+        history_file,
+        HISTORY_FIELDNAMES,
+        {
+            "date": day,
+            "timestamp": stamp,
+            "account_name": account_name,
+            "username": username,
+            "followers": followers,
+            "daily_change": change,
+            "daily_change_rate": change_rate,
+        },
+    )
+
+
+def write_tracker_log(
+    log_file: str,
+    stamp: str,
+    account_name: str,
+    username: str,
+    status: str,
+    message: str,
+) -> None:
+    """tracker_log.csv 에 계정별 처리 결과를 한 줄 남깁니다."""
+    append_csv_row(
+        log_file,
+        TRACKER_LOG_FIELDNAMES,
+        {
+            "timestamp": stamp,
+            "account_name": account_name,
+            "username": username,
+            "status": status,
+            "message": message,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6) 추적 실행 (track-followers 명령의 본체)
+# ---------------------------------------------------------------------------
+
+
+def print_tracking_summary(results: list[dict], history_file: str) -> None:
+    """실행이 끝난 뒤 사람이 읽기 좋은 요약을 출력합니다."""
+    line = "=" * 50
+    print()
+    print(line)
+    print(" 인스타그램 경쟁사 팔로워 추적 결과")
+    print(line)
+    print()
+
+    tracked = skipped = failed = 0
+
+    for result in results:
+        username = result["username"]
+        if result["status"] == "success":
+            tracked += 1
+            print(f"[성공] @{username}")
+            print(f"       팔로워: {result['followers']:,}명")
+            print(f"       변화: {format_change(result['change'], result['change_rate'])}")
+        elif result["status"] == "skip":
+            skipped += 1
+            print(f"[건너뜀] @{username}")
+            print("         오늘은 이미 기록했습니다.")
+        else:
+            failed += 1
+            print(f"[실패] @{username}")
+            print(f"       {result['message']}")
+        print()
+
+    print(line)
+    print(" 완료")
+    print(f" 기록: {tracked}건 / 건너뜀: {skipped}건 / 실패: {failed}건")
+    print(f" 히스토리 파일: {history_file}")
+    print(line)
+
+
+def track_followers(
+    accounts_file: str = DEFAULT_ACCOUNTS_FILE,
+    history_file: str = DEFAULT_HISTORY_FILE,
+    log_file: str = DEFAULT_TRACKER_LOG_FILE,
+    session_file: str = DEFAULT_SESSION_FILE,
+    headless: bool = True,
+    force: bool = False,
+    timeout: float = DEFAULT_FOLLOWER_TIMEOUT,
+    delay: float = DEFAULT_TRACK_DELAY,
+) -> int:
+    """경쟁사 계정들의 팔로워 수를 확인해 히스토리에 덧붙입니다.
+
+    진행 순서
+      1. accounts.csv 에서 계정 목록을 읽습니다.
+      2. 오늘 이미 기록된 계정은 건너뜁니다(--force 를 주면 건너뛰지 않습니다).
+      3. 남은 계정만 브라우저로 방문해 팔로워 수를 확인합니다(게시물 수집 없음).
+      4. 직전 기록과 비교해 증감/증감률을 계산하고 CSV 에 한 줄 덧붙입니다.
+      5. 계정마다 tracker_log.csv 에 성공/실패를 남깁니다.
+
+    돌려주는 값: 종료 코드(0=정상, 1=문제 있음)
+    """
+    print("=" * 50)
+    print(" 인스타그램 경쟁사 팔로워 추적기")
+    print(" (게시물은 수집하지 않고 팔로워 수만 확인합니다)")
+    print("=" * 50)
+
+    accounts = load_accounts(accounts_file)
+    if not accounts:
+        print(
+            f"[오류] '{accounts_file}' 에서 추적할 계정을 찾지 못했습니다.\n"
+            f"       account_name,username 형식으로 계정을 채운 뒤 다시 실행해 주세요."
+        )
+        return 1
+
+    # 기록 파일이 없으면 헤더만 있는 빈 파일을 미리 만들어 둡니다.
+    ensure_csv_file(history_file, HISTORY_FIELDNAMES)
+    ensure_csv_file(log_file, TRACKER_LOG_FIELDNAMES)
+
+    history = group_history_by_username(load_history(history_file))
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # --- 오늘 이미 기록한 계정 걸러내기 (중복 방지) -------------------------
+    results: list[dict] = []
+    targets: list[dict] = []
+
+    for account in accounts:
+        username = account["username"]
+        records = history.get(username, [])
+        if not force and already_tracked_on(records, today):
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[건너뜀] @{username} 은 오늘 이미 기록했습니다.")
+            write_tracker_log(
+                log_file, stamp, account["account_name"], username, "skip", "오늘 이미 기록됨"
+            )
+            results.append({**account, "status": "skip", "message": "오늘 이미 기록됨"})
+        else:
+            targets.append(account)
+
+    if not targets:
+        print("\n[정보] 오늘 기록할 계정이 없습니다. 다시 기록하려면 --force 를 붙여 실행하세요.")
+        print_tracking_summary(results, history_file)
+        return 0
+
+    if force:
+        print("[정보] --force 옵션: 오늘 이미 기록된 계정도 한 번 더 기록합니다.")
+    print(f"[정보] 확인할 계정 {len(targets)}개 — 브라우저를 엽니다.\n")
+
+    # --- 실제 수집 ----------------------------------------------------------
+    usernames = [account["username"] for account in targets]
+    by_username = {account["username"]: account for account in targets}
+
+    try:
+        stream = fetch_follower_counts_live(
+            usernames,
+            session_file=session_file,
+            headless=headless,
+            timeout=timeout,
+            delay=delay,
+        )
+        for username, followers, error, source in stream:
+            account = by_username[username]
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            day = stamp[:10]
+
+            if followers is None:
+                # 실패한 계정은 기록을 남기지 않습니다(0 으로 저장하면 통계가 망가집니다).
+                message = error or "팔로워 수를 찾지 못했습니다."
+                print(f"[실패] @{username} — {message}")
+                write_tracker_log(
+                    log_file, stamp, account["account_name"], username, "error", message
+                )
+                results.append({**account, "status": "error", "message": message})
+                continue
+
+            previous = find_previous_record(history.get(username, []), day)
+            change, change_rate = calc_follower_change(
+                followers, previous["followers"] if previous else None
+            )
+
+            append_history_record(
+                history_file,
+                day,
+                stamp,
+                account["account_name"],
+                username,
+                followers,
+                change,
+                change_rate,
+            )
+            # 방금 기록을 메모리에도 반영해 둡니다(같은 실행 안에서 중복 방지에 쓰입니다).
+            history.setdefault(username, []).append(
+                {
+                    "date": day,
+                    "timestamp": stamp,
+                    "account_name": account["account_name"],
+                    "username": username,
+                    "followers": followers,
+                }
+            )
+
+            print(f"[성공] @{username} — {followers:,}명  (읽은 경로: {source})")
+            write_tracker_log(
+                log_file,
+                stamp,
+                account["account_name"],
+                username,
+                "success",
+                f"{followers}명 수집 / 읽은 경로: {source}",
+            )
+            results.append(
+                {
+                    **account,
+                    "status": "success",
+                    "followers": followers,
+                    "change": change,
+                    "change_rate": change_rate,
+                    "message": "",
+                }
+            )
+
+    except TrackerError as e:
+        # 세션 파일이 없는 등, 계정 하나가 아니라 '전체'를 진행할 수 없는 경우입니다.
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[오류] {e}")
+        for account in targets:
+            write_tracker_log(
+                log_file, stamp, account["account_name"], account["username"], "error", str(e)
+            )
+            results.append({**account, "status": "error", "message": str(e)})
+        print_tracking_summary(results, history_file)
+        return 1
+
+    # 요약은 accounts.csv 에 적힌 순서대로 보여줍니다.
+    order = {account["username"]: index for index, account in enumerate(accounts)}
+    results.sort(key=lambda r: order.get(r["username"], 999))
+    print_tracking_summary(results, history_file)
+
+    failed = sum(1 for r in results if r["status"] == "error")
+    return 1 if failed and failed == len(results) else 0
+
+
+# ---------------------------------------------------------------------------
+# 7) 리포트 생성 (follower-report 명령)
+# ---------------------------------------------------------------------------
+
+
+def daily_records(records: list[dict]) -> list[dict]:
+    """하루에 여러 번 기록된 경우(--force) 그날의 '마지막 기록'만 남깁니다.
+
+    증감 계산은 '하루 단위'가 기준이라, 하루에 하나만 남겨야 값이 정확합니다.
+    """
+    by_day: dict[str, dict] = {}
+    for record in sorted(records, key=lambda r: (r["date"], r["timestamp"])):
+        by_day[record["date"]] = record
+    return [by_day[day] for day in sorted(by_day)]
+
+
+def shift_days(day: str, days: int) -> str:
+    """'2026-09-03' 에서 며칠 전/후 날짜 문자열을 만듭니다."""
+    return (date.fromisoformat(day) - timedelta(days=days)).isoformat()
+
+
+def find_record_on_or_before(records: list[dict], day: str) -> dict | None:
+    """해당 날짜 이전(같은 날 포함) 기록 중 가장 최근 것을 찾습니다."""
+    earlier = [record for record in records if record["date"] <= day]
+    return earlier[-1] if earlier else None
+
+
+def build_follower_history_sheet(grouped: dict[str, list[dict]]) -> list[list]:
+    """시트 1 — 일별 기록. 모든 기록을 최신순으로 나열합니다."""
+    sheet: list[list] = [
+        ["날짜", "기록시각", "계정명", "아이디", "팔로워 수", "일간 증감", "일간 증감률(%)"]
+    ]
+
+    rows: list[list] = []
+    for username, records in grouped.items():
+        ordered = sorted(records, key=lambda r: (r["date"], r["timestamp"]))
+        for index, record in enumerate(ordered):
+            # 파일에 적힌 값을 그대로 믿지 않고 여기서 다시 계산합니다.
+            # (--force 로 같은 날 여러 번 기록된 경우에도 값이 일관되게 나옵니다)
+            previous = None
+            for earlier in reversed(ordered[:index]):
+                if earlier["date"] < record["date"]:
+                    previous = earlier
+                    break
+            change, change_rate = calc_follower_change(
+                record["followers"], previous["followers"] if previous else None
+            )
+            rows.append(
+                [
+                    record["date"],
+                    record["timestamp"],
+                    record["account_name"] or username,
+                    username,
+                    record["followers"],
+                    change,
+                    change_rate,
+                ]
+            )
+
+    # 최신 기록이 위로 오게 정렬합니다.
+    rows.sort(key=lambda r: (str(r[0]), str(r[1]), str(r[3])), reverse=True)
+    sheet.extend(rows)
+    return sheet
+
+
+def build_account_summary_sheet(grouped: dict[str, list[dict]]) -> list[list]:
+    """시트 2 — 계정 요약. 최신 팔로워 수와 7일/30일 변화를 함께 봅니다.
+
+    7일·30일 비교는 그만큼의 기록이 쌓여 있을 때만 계산합니다.
+    데이터가 모자라면 잘못된 숫자를 보여주는 대신 빈 칸으로 둡니다.
+    """
+    sheet: list[list] = [
+        [
+            "계정명",
+            "아이디",
+            "최신 팔로워",
+            "이전 팔로워",
+            "최근 증감",
+            "7일 증감",
+            "30일 증감",
+            "7일 증감률(%)",
+            "30일 증감률(%)",
+            "최초 기록일",
+            "최신 기록일",
+            "기록 일수",
+        ]
+    ]
+
+    rows: list[list] = []
+    for username, records in grouped.items():
+        days = daily_records(records)
+        if not days:
+            continue
+
+        latest = days[-1]
+        previous = days[-2] if len(days) >= 2 else None
+        change, _ = calc_follower_change(
+            latest["followers"], previous["followers"] if previous else None
+        )
+
+        def period_change(period: int) -> tuple[Any, Any]:
+            """period 일 전(또는 그 이전 가장 가까운) 기록과 비교합니다."""
+            baseline = find_record_on_or_before(days, shift_days(latest["date"], period))
+            if baseline is None:
+                return "", ""  # 자료가 모자라면 빈 칸
+            return calc_follower_change(latest["followers"], baseline["followers"])
+
+        week_change, week_rate = period_change(7)
+        month_change, month_rate = period_change(30)
+
+        rows.append(
+            [
+                latest["account_name"] or username,
+                username,
+                latest["followers"],
+                previous["followers"] if previous else "",
+                change,
+                week_change,
+                month_change,
+                week_rate,
+                month_rate,
+                days[0]["date"],
+                latest["date"],
+                len(days),
+            ]
+        )
+
+    rows.sort(key=lambda r: str(r[0]))
+    sheet.extend(rows)
+    return sheet
+
+
+def build_monthly_growth_sheet(grouped: dict[str, list[dict]]) -> list[list]:
+    """시트 3 — 월별 성장. 달마다 '첫 기록 → 마지막 기록' 변화를 봅니다."""
+    sheet: list[list] = [
+        [
+            "월",
+            "계정명",
+            "아이디",
+            "시작 팔로워",
+            "종료 팔로워",
+            "순증감",
+            "성장률(%)",
+            "그 달의 기록 일수",
+        ]
+    ]
+
+    rows: list[list] = []
+    for username, records in grouped.items():
+        days = daily_records(records)
+
+        by_month: dict[str, list[dict]] = {}
+        for record in days:
+            by_month.setdefault(record["date"][:7], []).append(record)
+
+        for month, month_records in by_month.items():
+            first, last = month_records[0], month_records[-1]
+            change, change_rate = calc_follower_change(last["followers"], first["followers"])
+            rows.append(
+                [
+                    month,
+                    last["account_name"] or username,
+                    username,
+                    first["followers"],
+                    last["followers"],
+                    change,
+                    change_rate,
+                    len(month_records),
+                ]
+            )
+
+    # 최근 달이 위로 오게 정렬합니다.
+    rows.sort(key=lambda r: (str(r[0]), str(r[1])), reverse=True)
+    sheet.extend(rows)
+    return sheet
+
+
+def build_follower_report(
+    history_file: str = DEFAULT_HISTORY_FILE,
+    output_path: str = DEFAULT_REPORT_FILE,
+) -> list[str]:
+    """followers_history.csv 를 읽어 시트 3개짜리 엑셀 리포트를 만듭니다.
+
+    시트 구성
+      1) 일별 기록  : 날짜별 팔로워 수와 증감
+      2) 계정 요약  : 계정별 최신값 + 7일/30일 변화
+      3) 월별 성장  : 달마다 시작→종료 변화
+    """
+    records = load_history(history_file)
+    if not records:
+        raise TrackerError(
+            f"'{history_file}' 에 기록이 없습니다. "
+            "먼저 'python instagram_crawler.py track-followers' 를 실행해 주세요."
+        )
+
+    grouped = group_history_by_username(records)
+    sheets = {
+        SHEET_FOLLOWER_HISTORY: build_follower_history_sheet(grouped),
+        SHEET_ACCOUNT_SUMMARY: build_account_summary_sheet(grouped),
+        SHEET_MONTHLY_GROWTH: build_monthly_growth_sheet(grouped),
+    }
+
+    # 저장은 기존 export_result() 를 그대로 재사용합니다.
+    # (.xlsx 면 엑셀 한 파일, openpyxl 이 없거나 .csv 면 시트별 CSV)
+    written = export_result(sheets, output_path)
+
+    print(f"[완료] 계정 {len(grouped)}개 / 기록 {len(records)}건 → '{written[0]}' 저장")
+    return written
+
+
 # ---------------------------------------------------------------------------
 # CLI (커맨드라인 인터페이스)
 # ---------------------------------------------------------------------------
@@ -1336,6 +2472,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python instagram_crawler.py login\n"
             "  python instagram_crawler.py crawl https://www.instagram.com/bmwmotorradkorea/ "
             "--start 2026-01-01 --end 2026-08-10\n"
+            "  python instagram_crawler.py track-followers\n"
+            "  python instagram_crawler.py track-followers --force\n"
+            "  python instagram_crawler.py follower-report\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1432,6 +2571,66 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-json", help="수집한 원본 JSON을 이 경로에 함께 저장합니다. (선택)"
     )
 
+    # --- track-followers : 경쟁사 팔로워 추적 -------------------------------
+    p_track = subparsers.add_parser(
+        "track-followers",
+        help="accounts.csv 의 경쟁사 팔로워 수를 날짜별로 기록합니다(게시물은 수집하지 않습니다).",
+    )
+    p_track.add_argument(
+        "--accounts",
+        default=DEFAULT_ACCOUNTS_FILE,
+        help=f"추적할 계정 목록 파일 (기본: {DEFAULT_ACCOUNTS_FILE})",
+    )
+    p_track.add_argument(
+        "--history",
+        default=DEFAULT_HISTORY_FILE,
+        help=f"기록이 쌓이는 파일 (기본: {DEFAULT_HISTORY_FILE})",
+    )
+    p_track.add_argument(
+        "--log",
+        default=DEFAULT_TRACKER_LOG_FILE,
+        help=f"계정별 성공/실패 기록 파일 (기본: {DEFAULT_TRACKER_LOG_FILE})",
+    )
+    p_track.add_argument(
+        "--session-file",
+        default=DEFAULT_SESSION_FILE,
+        help=f"사용할 로그인 세션 파일 (기본: {DEFAULT_SESSION_FILE})",
+    )
+    p_track.add_argument("--show-browser", action="store_true", help="브라우저 창을 보이게 실행합니다.")
+    p_track.add_argument(
+        "--force",
+        action="store_true",
+        help="오늘 이미 기록한 계정도 한 번 더 기록합니다(기존 기록은 지우지 않습니다).",
+    )
+    p_track.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_FOLLOWER_TIMEOUT,
+        help=f"계정 하나당 최대 대기 시간(초) (기본: {DEFAULT_FOLLOWER_TIMEOUT})",
+    )
+    p_track.add_argument(
+        "--delay",
+        type=float,
+        default=DEFAULT_TRACK_DELAY,
+        help=f"계정과 계정 사이 대기 시간(초) (기본: {DEFAULT_TRACK_DELAY})",
+    )
+
+    # --- follower-report : 팔로워 히스토리 → 엑셀 --------------------------
+    p_report = subparsers.add_parser(
+        "follower-report",
+        help="쌓아둔 팔로워 기록을 시트 3개짜리 엑셀 리포트로 만듭니다.",
+    )
+    p_report.add_argument(
+        "--history",
+        default=DEFAULT_HISTORY_FILE,
+        help=f"읽어올 기록 파일 (기본: {DEFAULT_HISTORY_FILE})",
+    )
+    p_report.add_argument(
+        "--out",
+        default=DEFAULT_REPORT_FILE,
+        help=f"저장할 파일 경로 (기본: {DEFAULT_REPORT_FILE})",
+    )
+
     return parser
 
 
@@ -1450,6 +2649,40 @@ def main(argv: list[str] | None = None) -> int:
                 "       python -m playwright install chromium",
                 file=sys.stderr,
             )
+            return 1
+        return 0
+
+    # --- 팔로워 추적기 ------------------------------------------------------
+    # 게시물 수집 파이프라인과 완전히 별개이므로 여기서 처리하고 바로 끝냅니다.
+    if args.command == "track-followers":
+        try:
+            return track_followers(
+                accounts_file=args.accounts,
+                history_file=args.history,
+                log_file=args.log,
+                session_file=args.session_file,
+                headless=not args.show_browser,
+                force=args.force,
+                timeout=args.timeout,
+                delay=args.delay,
+            )
+        except ImportError:
+            print(
+                "[오류] Playwright가 설치되어 있지 않습니다.\n"
+                "       pip install -r requirements.txt\n"
+                "       python -m playwright install chromium",
+                file=sys.stderr,
+            )
+            return 1
+        except KeyboardInterrupt:
+            print("\n[중단] 사용자가 중지했습니다. 여기까지의 기록은 파일에 남아 있습니다.")
+            return 1
+
+    if args.command == "follower-report":
+        try:
+            build_follower_report(history_file=args.history, output_path=args.out)
+        except TrackerError as e:
+            print(f"[오류] {e}", file=sys.stderr)
             return 1
         return 0
 
