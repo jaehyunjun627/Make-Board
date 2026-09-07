@@ -2424,6 +2424,586 @@ def build_follower_report(
 
 
 # ---------------------------------------------------------------------------
+# 7) 매일 게시물 모니터링 (Daily_crawl 명령)
+# ---------------------------------------------------------------------------
+#
+#  무엇을 하는 기능인가
+#    "게시물이 올라온 뒤 3일 동안 좋아요·댓글이 얼마나 빨리 붙는지"를
+#    계정마다 하나의 엑셀 파일에 계속 쌓아 나갑니다.
+#
+#  핵심 개념 두 가지 (헷갈리면 안 됩니다)
+#    업로드일(upload_date)  : 그 게시물이 인스타그램에 올라온 날
+#    기록일(snapshot_date)  : 우리가 좋아요·댓글 수를 '들여다본' 날
+#
+#    예) 업로드일 2026-09-07 인 글을 2026-09-09 에 봤더니 좋아요 72개
+#        → '2026-09-09 좋아요' 칸에 72 를 적습니다. 업로드일은 그대로 둡니다.
+#
+#  기록 창(window)
+#    D+0 = 업로드 당일, D+1 = 다음 날, D+2 = 이틀 뒤. 여기까지만 기록합니다.
+#    D+3 부터는 아무것도 하지 않습니다.
+
+# 계정별 엑셀이 쌓이는 폴더
+DEFAULT_DAILY_DIR = "Daily_crawl"
+
+# 실행 기록(로그)이 쌓이는 폴더
+DEFAULT_LOG_DIR = "logs"
+
+# 며칠 동안 추적할지. 3 이면 D+0, D+1, D+2 까지입니다.
+SNAPSHOT_WINDOW_DAYS = 3
+
+# 계정별 엑셀 안의 시트 이름
+SHEET_DAILY = "일별 스냅샷"
+
+# 게시물마다 고정으로 들어가는 컬럼(이 뒤에 날짜별 컬럼이 붙습니다)
+DAILY_BASE_COLUMNS = ["계정", "업로드일", "타입", "본문", "링크"]
+
+# 날짜별 컬럼 이름 규칙:  '2026-09-07 좋아요' / '2026-09-07 댓글'
+DAILY_LIKE_SUFFIX = "좋아요"
+DAILY_COMMENT_SUFFIX = "댓글"
+SNAPSHOT_COLUMN_PATTERN = re.compile(
+    rf"^(\d{{4}}-\d{{2}}-\d{{2}}) ({DAILY_LIKE_SUFFIX}|{DAILY_COMMENT_SUFFIX})$"
+)
+
+# 하루치를 훑을 때 계정당 최대 몇 건까지 볼지(안전장치)
+DEFAULT_DAILY_LIMIT = 120
+
+# 파일 이름에 쓸 수 없는 글자
+UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+
+
+class DailyCrawlError(Exception):
+    """계정 하나를 처리하다 생긴, 사용자에게 설명 가능한 오류.
+
+    이 오류는 전체를 멈추지 않고 그 계정만 실패로 기록한 뒤 다음 계정으로 넘어갑니다.
+    """
+
+
+# --- 날짜 계산 --------------------------------------------------------------
+
+
+def calculate_snapshot_date(explicit: str | None = None) -> str:
+    """이번 실행에서 '기록할 날짜'를 정합니다.
+
+    기본값은 오늘입니다. --date 를 주면 그날을 기록일로 삼습니다
+    (지난 날짜를 복구하거나 테스트할 때 사용).
+    """
+    if explicit:
+        return explicit
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def calculate_target_date(snapshot_date: str) -> str:
+    """'새로 올라온 글'을 찾을 기준일 = 기록일의 하루 전(어제)."""
+    return shift_days(snapshot_date, 1)
+
+
+def snapshot_window_start(snapshot_date: str) -> str:
+    """아직 기록 창이 살아 있는 게시물의 가장 오래된 업로드일.
+
+    D+2 까지 기록하므로, 기록일 기준 이틀 전에 올라온 글까지가 대상입니다.
+    """
+    return shift_days(snapshot_date, SNAPSHOT_WINDOW_DAYS - 1)
+
+
+def calculate_snapshot_day(upload_date: str, snapshot_date: str) -> int | None:
+    """업로드일과 기록일의 차이(D+N)를 구합니다.
+
+    0, 1, 2 중 하나면 기록해도 되는 날이고,
+    창을 벗어났거나(3일 이상) 업로드 전 날짜면 None 을 돌려줍니다.
+    """
+    if not upload_date or not snapshot_date:
+        return None
+    try:
+        uploaded = date.fromisoformat(upload_date)
+        observed = date.fromisoformat(snapshot_date)
+    except ValueError:
+        return None
+
+    offset = (observed - uploaded).days
+    if 0 <= offset <= SNAPSHOT_WINDOW_DAYS - 1:
+        return offset
+    return None  # 업로드 전이거나(음수) D+3 이후
+
+
+def snapshot_columns(day: str) -> tuple[str, str]:
+    """그 날짜의 (좋아요 컬럼명, 댓글 컬럼명) 을 만듭니다."""
+    return f"{day} {DAILY_LIKE_SUFFIX}", f"{day} {DAILY_COMMENT_SUFFIX}"
+
+
+# --- 파일 경로 --------------------------------------------------------------
+
+
+def safe_filename(name: str) -> str:
+    """계정 이름을 파일 이름으로 쓸 수 있게 다듬습니다."""
+    cleaned = UNSAFE_FILENAME_CHARS.sub("_", str(name)).strip().strip(".")
+    return cleaned or "unknown"
+
+
+def get_account_output_path(
+    account_name: str,
+    username: str,
+    directory: str = DEFAULT_DAILY_DIR,
+) -> str:
+    """계정별 엑셀 파일 경로를 만듭니다.
+
+    accounts.csv 의 사람이 읽는 이름(account_name)을 우선 쓰고,
+    비어 있으면 아이디를 씁니다.  예) Daily_crawl/BMW 모토라드 코리아.xlsx
+    """
+    label = account_name.strip() if account_name and account_name.strip() else username
+    return os.path.join(directory, f"{safe_filename(label)}.xlsx")
+
+
+def shortcode_from_url(url: Any) -> str:
+    """게시물 주소에서 고유 코드(shortcode)만 뽑습니다.
+
+    'https://instagram.com/p/ABC123/' → 'ABC123'
+    이 코드가 게시물을 구분하는 유일한 기준입니다.
+    (본문·업로드일·줄 번호로는 절대 구분하지 않습니다)
+    """
+    if not url:
+        return ""
+    parts = [p for p in str(url).split("?")[0].split("#")[0].split("/") if p]
+    return parts[-1] if parts else ""
+
+
+# --- 엑셀 읽기/쓰기 ---------------------------------------------------------
+
+
+def load_daily_workbook(path: str) -> tuple[list[dict], set[str]]:
+    """계정별 엑셀을 읽어 (게시물 줄 목록, 이미 있는 기록 날짜들) 을 돌려줍니다.
+
+    파일이 없으면 빈 상태로 시작합니다.
+    각 줄은 {컬럼명: 값} 형태이며, 내부용으로 '_code'(shortcode)를 함께 담습니다.
+    """
+    if not os.path.exists(path):
+        return [], set()
+
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path)
+    sheet = workbook[SHEET_DAILY] if SHEET_DAILY in workbook.sheetnames else workbook.worksheets[0]
+
+    values = list(sheet.iter_rows(values_only=True))
+    workbook.close()
+    if not values:
+        return [], set()
+
+    header = [str(c).strip() if c is not None else "" for c in values[0]]
+    rows: list[dict] = []
+    snapshot_days: set[str] = set()
+
+    for name in header:
+        match = SNAPSHOT_COLUMN_PATTERN.match(name)
+        if match:
+            snapshot_days.add(match.group(1))
+
+    for raw in values[1:]:
+        row = {}
+        for index, name in enumerate(header):
+            if not name:
+                continue
+            row[name] = raw[index] if index < len(raw) and raw[index] is not None else ""
+        code = shortcode_from_url(row.get("링크", ""))
+        if not code:
+            continue  # 링크가 없으면 게시물을 특정할 수 없으므로 버립니다.
+        row["_code"] = code
+        rows.append(row)
+
+    return rows, snapshot_days
+
+
+def save_daily_workbook(path: str, rows: list[dict], snapshot_days: set[str]) -> None:
+    """게시물 줄들을 계정별 엑셀로 다시 씁니다.
+
+    날짜 컬럼이 새로 생겨도 순서가 꼬이지 않도록 시트를 통째로 다시 만듭니다.
+    (엑셀 중간에 열을 끼워 넣는 방식보다 안전합니다)
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    header = list(DAILY_BASE_COLUMNS)
+    for day in sorted(snapshot_days):
+        header.extend(snapshot_columns(day))
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    sheet = workbook.create_sheet(title=SHEET_DAILY)
+    sheet.append(header)
+
+    # 최신 업로드가 위로 오도록 정렬합니다.
+    for row in sorted(rows, key=lambda r: (str(r.get("업로드일", "")), r.get("_code", "")), reverse=True):
+        sheet.append([row.get(name, "") for name in header])
+
+    # 첫 줄(헤더) 강조 + 스크롤해도 헤더가 보이도록 고정
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    sheet.freeze_panes = "B2"
+
+    # 링크 컬럼은 진짜 하이퍼링크로 만들어 클릭해서 열 수 있게 합니다.
+    if "링크" in header:
+        link_index = header.index("링크") + 1
+        for row_index in range(2, sheet.max_row + 1):
+            cell = sheet.cell(row=row_index, column=link_index)
+            if cell.value:
+                cell.hyperlink = str(cell.value)
+                cell.font = Font(color="0563C1", underline="single")
+
+    # 열 너비를 내용에 맞춰 적당히 넓힙니다(본문은 너무 길어지지 않게 제한).
+    for column_cells in sheet.columns:
+        longest = max(
+            (len(str(cell.value)) for cell in column_cells if cell.value is not None),
+            default=0,
+        )
+        letter = column_cells[0].column_letter
+        sheet.column_dimensions[letter].width = min(max(longest + 2, 10), 50)
+
+    try:
+        workbook.save(path)
+    except PermissionError:
+        raise DailyCrawlError(
+            f"'{path}' 파일에 쓸 수 없습니다. 엑셀에서 열어두었다면 닫고 다시 실행해 주세요."
+        )
+
+
+# --- 수집과 병합 ------------------------------------------------------------
+
+
+def deduplicate_posts(posts: list[dict]) -> tuple[list[dict], int]:
+    """같은 게시물이 여러 번 잡힌 경우 하나만 남깁니다.
+
+    Playwright 가 같은 글을 여러 응답에서 가로챌 수 있어 반드시 필요합니다.
+    구분 기준은 오직 링크의 shortcode 입니다.
+    """
+    seen: set[str] = set()
+    unique: list[dict] = []
+    duplicates = 0
+
+    for post in posts:
+        code = shortcode_from_url(post.get("링크", ""))
+        if not code:
+            continue
+        if code in seen:
+            duplicates += 1
+            continue
+        seen.add(code)
+        unique.append(post)
+
+    return unique, duplicates
+
+
+def collect_posts_for_snapshot(
+    username: str,
+    snapshot_date: str,
+    session_file: str = DEFAULT_SESSION_FILE,
+    headless: bool = True,
+    limit: int = DEFAULT_DAILY_LIMIT,
+    delay: float = 2.0,
+) -> list[dict]:
+    """기록 창(D+0~D+2)에 걸리는 게시물만 수집합니다.
+
+    새로 올라온 글과, 아직 3일이 안 지난 예전 글을 한 번에 가져옵니다.
+    기록 창을 벗어난 오래된 글까지 매일 훑지 않으므로 요청 수가 적습니다.
+    """
+    window_start = snapshot_window_start(snapshot_date)
+
+    raw_posts, _followers = fetch_posts_live(
+        username=username,
+        limit=limit,
+        start_date=window_start,
+        end_date=snapshot_date,
+        session_file=session_file,
+        headless=headless,
+        delay=delay,
+    )
+
+    # 기존 정리 로직을 그대로 재사용합니다(중복 제거·기간 필터·계정 필터).
+    return parse_data(
+        raw_posts,
+        start_date=window_start,
+        end_date=snapshot_date,
+        account=username,
+    )
+
+
+def merge_daily_posts(
+    existing_rows: list[dict],
+    new_posts: list[dict],
+    account_name: str,
+    snapshot_date: str,
+    force: bool = False,
+) -> dict:
+    """수집한 게시물을 기존 줄에 합칩니다.
+
+    규칙
+      - 게시물 하나 = 줄 하나. 같은 글이 다시 잡혀도 새 줄을 만들지 않습니다.
+      - 기록 창(D+0~D+2)을 벗어난 게시물은 건드리지 않습니다.
+      - 이미 값이 있는 칸은 그대로 둡니다(--force 를 주면 덮어씁니다).
+
+    돌려주는 값: 처리 결과 요약(dict)
+    """
+    by_code = {row["_code"]: row for row in existing_rows}
+    like_column, comment_column = snapshot_columns(snapshot_date)
+
+    stats = {
+        "new_rows": 0,
+        "updated_rows": 0,
+        "snapshots_written": 0,
+        "snapshots_skipped": 0,
+        "out_of_window": 0,
+    }
+
+    for post in new_posts:
+        upload_date = str(post.get("업로드일", ""))
+        code = shortcode_from_url(post.get("링크", ""))
+        if not code:
+            continue
+
+        # 기록해도 되는 날인지 확인합니다(업로드 전이거나 D+3 이후면 건너뜁니다).
+        offset = calculate_snapshot_day(upload_date, snapshot_date)
+        if offset is None:
+            stats["out_of_window"] += 1
+            continue
+
+        row = by_code.get(code)
+        if row is None:
+            row = {
+                "계정": account_name,
+                "업로드일": upload_date,
+                "타입": post.get("타입", ""),
+                "본문": post.get("본문", ""),
+                "링크": post.get("링크", ""),
+                "_code": code,
+            }
+            by_code[code] = row
+            existing_rows.append(row)
+            stats["new_rows"] += 1
+        else:
+            # 업로드일은 절대 덮어쓰지 않습니다(기록일과 헷갈리면 안 됩니다).
+            # 비어 있던 정보만 채워 넣습니다.
+            for key, value in (
+                ("계정", account_name),
+                ("타입", post.get("타입", "")),
+                ("본문", post.get("본문", "")),
+            ):
+                if not row.get(key) and value:
+                    row[key] = value
+            stats["updated_rows"] += 1
+
+        already_recorded = row.get(like_column, "") not in ("", None)
+        if already_recorded and not force:
+            stats["snapshots_skipped"] += 1
+            continue
+
+        row[like_column] = post.get("좋아요", "")
+        row[comment_column] = post.get("댓글", "")
+        stats["snapshots_written"] += 1
+
+    return stats
+
+
+# --- 로그 -------------------------------------------------------------------
+
+
+def daily_log_path(snapshot_date: str, log_dir: str = DEFAULT_LOG_DIR) -> str:
+    """logs/daily_crawl_2026-09-07.log 형태의 경로를 만듭니다."""
+    return os.path.join(log_dir, f"daily_crawl_{snapshot_date}.log")
+
+
+def write_daily_log(log_path: str, level: str, message: str) -> None:
+    """로그 파일에 한 줄 남기고 화면에도 보여줍니다.
+
+    화면 출력이 이미 파일로 넘어가 있으면(BAT 등) 같은 줄이 두 번 쌓이지
+    않도록 화면 출력은 생략합니다.
+    """
+    stamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{level}] {stamp} {message}"
+
+    try:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"[주의] 로그를 남기지 못했습니다: {e}", file=sys.stderr)
+
+    try:
+        if sys.stdout.isatty():
+            print(line)
+    except Exception:
+        print(line)
+
+
+# --- 본체 -------------------------------------------------------------------
+
+
+def classify_crawl_error(error: Exception) -> str:
+    """실패 원인을 사람이 읽을 수 있는 한 줄로 정리합니다.
+
+    '로그인 만료'와 '게시물 0건'을 절대 같은 것으로 취급하지 않기 위해
+    원인을 구분해 둡니다.
+    """
+    text = str(error)
+    if isinstance(error, DailyCrawlError):
+        return text
+    if "로그인" in text or "세션" in text or "challenge" in text.lower():
+        return f"로그인/세션 문제 — {text}"
+    if isinstance(error, TimeoutError) or "timeout" in text.lower():
+        return f"네트워크/응답 지연 — {text}"
+    if isinstance(error, (KeyError, IndexError, ValueError, TypeError)):
+        return f"응답 해석 실패 — {type(error).__name__}: {text}"
+    return f"{type(error).__name__}: {text}"
+
+
+def run_daily_crawl(
+    accounts_file: str = DEFAULT_ACCOUNTS_FILE,
+    output_dir: str = DEFAULT_DAILY_DIR,
+    log_dir: str = DEFAULT_LOG_DIR,
+    session_file: str = DEFAULT_SESSION_FILE,
+    snapshot_date: str | None = None,
+    headless: bool = True,
+    force: bool = False,
+    limit: int = DEFAULT_DAILY_LIMIT,
+    delay: float = 2.0,
+) -> int:
+    """Daily_crawl 명령의 본체.
+
+    계정마다 이렇게 돕니다.
+      1) 기록 창(D+0~D+2)에 걸리는 게시물을 수집
+      2) 계정별 엑셀을 읽어 링크(shortcode)로 대조
+      3) 없으면 새 줄, 있으면 그 줄의 오늘 날짜 칸만 채움
+      4) 엑셀 저장
+
+    한 계정이 실패해도 나머지 계정은 계속 처리합니다.
+    돌려주는 값: 종료 코드(0=전부 성공, 1=하나라도 실패)
+    """
+    snapshot = calculate_snapshot_date(snapshot_date)
+    target = calculate_target_date(snapshot)
+    window_start = snapshot_window_start(snapshot)
+    log_path = daily_log_path(snapshot, log_dir)
+
+    print("=" * 56)
+    print(" 인스타그램 일별 게시물 모니터링 (Daily_crawl)")
+    print(f" 기록일(스냅샷): {snapshot}")
+    print(f" 신규 게시물 기준일: {target}")
+    print(f" 추적 대상 업로드일 범위: {window_start} ~ {snapshot}")
+    print(f" 로그: {log_path}")
+    print("=" * 56)
+
+    write_daily_log(log_path, "INFO", "Daily crawl started")
+    write_daily_log(log_path, "INFO", f"Target upload date: {target}")
+    write_daily_log(log_path, "INFO", f"Snapshot date: {snapshot}")
+    write_daily_log(log_path, "INFO", f"Snapshot window: {window_start} ~ {snapshot}")
+    if force:
+        write_daily_log(log_path, "INFO", "--force: 이미 기록된 칸도 다시 덮어씁니다")
+
+    accounts = load_accounts(accounts_file)
+    if not accounts:
+        message = f"'{accounts_file}' 에서 계정을 찾지 못했습니다."
+        write_daily_log(log_path, "ERROR", message)
+        print(f"[오류] {message}\n       account_name,username 형식으로 채운 뒤 다시 실행해 주세요.")
+        return 1
+
+    # 로그인 세션이 없으면 '게시물 0건'처럼 보이는 잘못된 결과가 나옵니다.
+    # 시작 전에 확인해서 분명하게 알려줍니다.
+    if not os.path.exists(session_file):
+        message = (
+            f"로그인 세션 파일('{session_file}')이 없습니다. "
+            "먼저 'python instagram_crawler.py login' 을 실행해 주세요."
+        )
+        write_daily_log(log_path, "ERROR", message)
+        print(f"[오류] {message}")
+        return 1
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for account in accounts:
+        account_name = account["account_name"]
+        username = account["username"]
+        write_daily_log(log_path, "INFO", f"{account_name} (@{username})")
+
+        try:
+            posts = collect_posts_for_snapshot(
+                username=username,
+                snapshot_date=snapshot,
+                session_file=session_file,
+                headless=headless,
+                limit=limit,
+                delay=delay,
+            )
+            posts, duplicates = deduplicate_posts(posts)
+            if duplicates:
+                write_daily_log(log_path, "INFO", f"  Duplicate posts removed: {duplicates}")
+
+            path = get_account_output_path(account_name, username, output_dir)
+            rows, snapshot_days = load_daily_workbook(path)
+
+            stats = merge_daily_posts(
+                existing_rows=rows,
+                new_posts=posts,
+                account_name=account_name,
+                snapshot_date=snapshot,
+                force=force,
+            )
+
+            if stats["snapshots_written"]:
+                snapshot_days.add(snapshot)
+
+            save_daily_workbook(path, rows, snapshot_days)
+
+            write_daily_log(log_path, "INFO", f"  Posts discovered: {len(posts)}")
+            write_daily_log(log_path, "INFO", f"  New posts: {stats['new_rows']}")
+            write_daily_log(
+                log_path, "INFO", f"  Existing posts updated: {stats['updated_rows']}"
+            )
+            write_daily_log(
+                log_path, "INFO", f"  Snapshots updated: {stats['snapshots_written']}"
+            )
+            if stats["snapshots_skipped"]:
+                write_daily_log(
+                    log_path,
+                    "INFO",
+                    f"  Snapshots skipped (already recorded): {stats['snapshots_skipped']}",
+                )
+            if stats["out_of_window"]:
+                write_daily_log(
+                    log_path,
+                    "INFO",
+                    f"  Skipped (outside D+0~D+2 window): {stats['out_of_window']}",
+                )
+            write_daily_log(log_path, "INFO", f"  Saved: {path}")
+            succeeded.append(account_name)
+
+        except KeyboardInterrupt:
+            write_daily_log(log_path, "ERROR", "사용자가 중지했습니다.")
+            print("\n[중단] 여기까지의 결과는 파일에 저장되어 있습니다.")
+            return 1
+        except Exception as e:  # 한 계정의 실패가 전체를 멈추지 않게 합니다.
+            reason = classify_crawl_error(e)
+            write_daily_log(log_path, "ERROR", f"{account_name}: {reason}")
+            failed.append((account_name, reason))
+
+    write_daily_log(log_path, "INFO", "Daily crawl completed")
+    write_daily_log(log_path, "INFO", f"Success: {len(succeeded)}")
+    write_daily_log(log_path, "INFO", f"Failed: {len(failed)}")
+
+    print("\n" + "=" * 56)
+    print(f" 성공: {len(succeeded)}개 계정")
+    print(f" 실패: {len(failed)}개 계정")
+    for name, reason in failed:
+        print(f"   - {name}: {reason}")
+    print(f" 결과 폴더: {output_dir}")
+    print(f" 로그 파일: {log_path}")
+    print("=" * 56)
+
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
 # CLI (커맨드라인 인터페이스)
 # ---------------------------------------------------------------------------
 
@@ -2472,7 +3052,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python instagram_crawler.py login\n"
             "  python instagram_crawler.py crawl https://www.instagram.com/bmwmotorradkorea/ "
             "--start 2026-01-01 --end 2026-08-10\n"
-            "  python instagram_crawler.py track-followers\n"
+            "  python instagram_crawler.py track-followers\n"            "  python instagram_crawler.py Daily_crawl\n"
+            "  python instagram_crawler.py Daily_crawl --date 2026-09-07\n"
             "  python instagram_crawler.py track-followers --force\n"
             "  python instagram_crawler.py follower-report\n"
         ),
@@ -2631,6 +3212,58 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"저장할 파일 경로 (기본: {DEFAULT_REPORT_FILE})",
     )
 
+    # --- Daily_crawl : 매일 게시물 모니터링 --------------------------------
+    p_daily = subparsers.add_parser(
+        "Daily_crawl",
+        help="계정별로 게시물을 매일 확인해 3일간의 좋아요·댓글 변화를 엑셀에 쌓습니다.",
+    )
+    p_daily.add_argument(
+        "--date",
+        help=(
+            "기록일(스냅샷 날짜) YYYY-MM-DD. 생략하면 오늘. "
+            "지난 날짜를 넣으면 그날 관찰한 것처럼 기록합니다(복구·테스트용)."
+        ),
+    )
+    p_daily.add_argument(
+        "--accounts",
+        default=DEFAULT_ACCOUNTS_FILE,
+        help=f"계정 목록 파일 (기본: {DEFAULT_ACCOUNTS_FILE})",
+    )
+    p_daily.add_argument(
+        "--dir",
+        dest="output_dir",
+        default=DEFAULT_DAILY_DIR,
+        help=f"계정별 엑셀을 저장할 폴더 (기본: {DEFAULT_DAILY_DIR})",
+    )
+    p_daily.add_argument(
+        "--log-dir",
+        default=DEFAULT_LOG_DIR,
+        help=f"실행 기록을 남길 폴더 (기본: {DEFAULT_LOG_DIR})",
+    )
+    p_daily.add_argument(
+        "--session-file",
+        default=DEFAULT_SESSION_FILE,
+        help=f"사용할 세션 파일 (기본: {DEFAULT_SESSION_FILE})",
+    )
+    p_daily.add_argument(
+        "--force",
+        action="store_true",
+        help="이미 기록된 날짜 칸도 다시 수집해 덮어씁니다.",
+    )
+    p_daily.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_DAILY_LIMIT,
+        help=f"계정당 최대 확인 게시물 수 (기본: {DEFAULT_DAILY_LIMIT})",
+    )
+    p_daily.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        help="스크롤 사이 대기 시간(초) (기본: 2.0)",
+    )
+    p_daily.add_argument("--show-browser", action="store_true", help="브라우저 창을 보이게 실행합니다.")
+
     return parser
 
 
@@ -2676,6 +3309,33 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         except KeyboardInterrupt:
             print("\n[중단] 사용자가 중지했습니다. 여기까지의 기록은 파일에 남아 있습니다.")
+            return 1
+
+    # --- 일별 게시물 모니터링 ------------------------------------------------
+    if args.command == "Daily_crawl":
+        snapshot = validate_date(args.date, "--date")
+        try:
+            return run_daily_crawl(
+                accounts_file=args.accounts,
+                output_dir=args.output_dir,
+                log_dir=args.log_dir,
+                session_file=args.session_file,
+                snapshot_date=snapshot,
+                headless=not args.show_browser,
+                force=args.force,
+                limit=args.limit,
+                delay=args.delay,
+            )
+        except ImportError:
+            print(
+                "[오류] Playwright 또는 openpyxl 이 설치되어 있지 않습니다.\n"
+                "       pip install -r requirements.txt\n"
+                "       python -m playwright install chromium",
+                file=sys.stderr,
+            )
+            return 1
+        except KeyboardInterrupt:
+            print("\n[중단] 사용자가 중지했습니다. 여기까지의 결과는 저장되어 있습니다.")
             return 1
 
     if args.command == "follower-report":

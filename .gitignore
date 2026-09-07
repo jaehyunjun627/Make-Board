@@ -16,3 +16,7 @@ dataset_*.json
 # 기타
 .DS_Store
 *.log
+
+# 일별 모니터링 결과물
+Daily_crawl/
+logs/
