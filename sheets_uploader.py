@@ -293,6 +293,48 @@ def service_account_email(credentials_file: str) -> str:
         return "(알 수 없음)"
 
 
+def describe_sheets_error(error: Exception, credentials_file: str, spreadsheet_id: str) -> str:
+    """구글이 돌려준 오류를 '무엇을 고쳐야 하는지' 로 바꿔 줍니다.
+
+    원인이 셋 다 달라서, 메시지도 달라야 사용자가 헤매지 않습니다.
+      - 키 자체가 잘못됨      → 키 파일을 다시 받아야 함
+      - 시트를 공유하지 않음  → 서비스 계정을 편집자로 추가해야 함
+      - 시트 ID가 틀림        → 주소를 다시 확인해야 함
+    """
+    email = service_account_email(credentials_file)
+    text = str(error)
+    status = getattr(getattr(error, "resp", None), "status", None)
+
+    if "invalid_grant" in text or "Invalid JWT" in text or "invalid_client" in text:
+        return (
+            f"구글이 인증 키를 거부했습니다.\n"
+            f"       '{credentials_file}' 이 올바른 서비스 계정 키인지 확인해 주세요.\n"
+            f"       (키를 지웠거나 서비스 계정을 삭제하면 이렇게 됩니다)"
+        )
+
+    if status == 403 or "PERMISSION_DENIED" in text or "does not have permission" in text:
+        return (
+            f"시트에 접근 권한이 없습니다.\n"
+            f"       구글 시트에서 '공유' 를 눌러 아래 주소를 '편집자' 로 추가해 주세요.\n"
+            f"       {email}"
+        )
+
+    if status == 404 or "notFound" in text or "NOT_FOUND" in text:
+        return (
+            f"그런 시트를 찾지 못했습니다 (ID: {spreadsheet_id}).\n"
+            f"       주소의 /d/ 와 /edit 사이 문자열이 맞는지 확인해 주세요."
+        )
+
+    if "Google Sheets API has not been used" in text or "SERVICE_DISABLED" in text:
+        return (
+            f"이 프로젝트에서 Google Sheets API 가 아직 켜져 있지 않습니다.\n"
+            f"       구글 클라우드 콘솔 → API 및 서비스 → 라이브러리 → "
+            f"'Google Sheets API' → 사용"
+        )
+
+    return f"시트를 열지 못했습니다: {text}"
+
+
 def fetch_sheet_titles(service, spreadsheet_id: str) -> list[dict]:
     """스프레드시트에 들어있는 탭 목록(이름·gid·순서)을 가져옵니다."""
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -493,17 +535,14 @@ def run_sheets_upload(
 
     service = None
     sheets: list[dict] = []
-    if not dry_run:
+    if uploads and not dry_run:
         service = build_sheets_service(credentials_file)
         try:
             sheets = fetch_sheet_titles(service, spreadsheet_id)
+        except UploadError:
+            raise
         except Exception as e:
-            email = service_account_email(credentials_file)
-            raise UploadError(
-                f"시트를 열지 못했습니다: {e}\n"
-                f"       이 서비스 계정을 시트에 '편집자'로 공유했는지 확인해 주세요.\n"
-                f"       서비스 계정 이메일: {email}"
-            )
+            raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
         titles = ", ".join(f"{s['title']}(gid={s['gid']})" for s in sheets)
         write_upload_log(log_path, "INFO", f"Tabs: {titles}")
 
@@ -956,7 +995,7 @@ def run_monthly_report(
             f"       쓸 수 있는 지표: {', '.join(MONTHLY_METRICS)}"
         )
 
-    write_daily_log(log_path, "INFO", "월간 지표 표 채우기")
+    write_upload_log(log_path, "INFO", "월간 지표 표 채우기")
 
     metrics = aggregate_monthly_metrics(
         followers_history=settings.get("followers_history", "followers_history.csv"),
@@ -964,7 +1003,7 @@ def run_monthly_report(
         brand_map=brand_map,
     )
     if not metrics:
-        write_daily_log(log_path, "INFO", "  집계할 자료가 없습니다.")
+        write_upload_log(log_path, "INFO", "  집계할 자료가 없습니다.")
         return 0
 
     target_months = months or settings.get("months")
@@ -977,25 +1016,33 @@ def run_monthly_report(
         summary = ", ".join(
             f"{k} {v:,}" for k, v in metrics[(month, brand)].items()
         )
-        write_daily_log(log_path, "INFO", f"  {month} / {brand}: {summary}")
+        write_upload_log(log_path, "INFO", f"  {month} / {brand}: {summary}")
 
     if dry_run:
-        write_daily_log(
+        write_upload_log(
             log_path, "INFO", "  [미리보기] 시트를 읽지 않았으므로 여기까지만 확인합니다."
         )
         return 0
 
-    service = build_sheets_service(config.get("credentials_file", DEFAULT_CREDENTIALS_FILE))
-    sheets = fetch_sheet_titles(service, spreadsheet_id)
+    credentials_file = config.get("credentials_file", DEFAULT_CREDENTIALS_FILE)
+    service = build_sheets_service(credentials_file)
+    try:
+        sheets = fetch_sheet_titles(service, spreadsheet_id)
+    except Exception as e:
+        raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
+
     sheet_title = resolve_sheet_title(sheets, settings.get("sheet", 0))
 
-    grid = read_report_grid(service, spreadsheet_id, sheet_title)
+    try:
+        grid = read_report_grid(service, spreadsheet_id, sheet_title)
+    except Exception as e:
+        raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
     rows = find_report_rows(
         grid,
         settings.get("month_column", "B"),
         settings.get("brand_column", "C"),
     )
-    write_daily_log(log_path, "INFO", f"  '{sheet_title}' 에서 {len(rows)}개 줄을 찾았습니다.")
+    write_upload_log(log_path, "INFO", f"  '{sheet_title}' 에서 {len(rows)}개 줄을 찾았습니다.")
 
     updates, notes = build_monthly_updates(
         metrics=metrics,
@@ -1007,10 +1054,10 @@ def run_monthly_report(
         overwrite=overwrite or bool(settings.get("overwrite")),
     )
     for note in notes:
-        write_daily_log(log_path, "INFO", f"  {note}")
+        write_upload_log(log_path, "INFO", f"  {note}")
 
     changed = apply_updates(service, spreadsheet_id, updates)
-    write_daily_log(log_path, "INFO", f"  {len(updates)}칸 기록 (바뀐 칸 {changed}개)")
+    write_upload_log(log_path, "INFO", f"  {len(updates)}칸 기록 (바뀐 칸 {changed}개)")
     return 0
 
 
