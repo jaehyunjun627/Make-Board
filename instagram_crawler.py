@@ -2479,7 +2479,9 @@ SNAPSHOT_WINDOW_DAYS = 3
 SHEET_DAILY = "일별 스냅샷"
 
 # 게시물마다 고정으로 들어가는 컬럼(이 뒤에 날짜별 컬럼이 붙습니다)
-DAILY_BASE_COLUMNS = ["계정", "업로드일", "타입", "본문", "링크"]
+#   팔로워 / 참여율(%) 은 '그 줄을 마지막으로 갱신한 날' 기준 값입니다.
+#   (날짜별 팔로워 추이는 track-followers 가 따로 기록합니다)
+DAILY_BASE_COLUMNS = ["계정", "업로드일", "팔로워", "참여율(%)", "타입", "본문", "링크"]
 
 # 날짜별 컬럼 이름 규칙:  '2026-09-07 좋아요' / '2026-09-07 댓글'
 DAILY_LIKE_SUFFIX = "좋아요"
@@ -2736,15 +2738,18 @@ def collect_posts_for_snapshot(
     headless: bool = True,
     limit: int = DEFAULT_DAILY_LIMIT,
     delay: float = 2.0,
-) -> list[dict]:
+) -> tuple[list[dict], int | None]:
     """기록 창(D+0~D+2)에 걸리는 게시물만 수집합니다.
 
     새로 올라온 글과, 아직 3일이 안 지난 예전 글을 한 번에 가져옵니다.
     기록 창을 벗어난 오래된 글까지 매일 훑지 않으므로 요청 수가 적습니다.
+
+    돌려주는 값: (게시물 목록, 팔로워 수 또는 None)
+    팔로워 수는 프로필 응답에서 자동으로 찾으며, 참여율 계산과 결과 표시에 씁니다.
     """
     window_start = snapshot_window_start(snapshot_date)
 
-    raw_posts, _followers = fetch_posts_live(
+    raw_posts, followers = fetch_posts_live(
         username=username,
         limit=limit,
         start_date=window_start,
@@ -2755,12 +2760,13 @@ def collect_posts_for_snapshot(
     )
 
     # 기존 정리 로직을 그대로 재사용합니다(중복 제거·기간 필터·계정 필터).
-    return parse_data(
+    posts = parse_data(
         raw_posts,
         start_date=window_start,
         end_date=snapshot_date,
         account=username,
     )
+    return posts, followers
 
 
 def merge_daily_posts(
@@ -2769,6 +2775,7 @@ def merge_daily_posts(
     account_name: str,
     snapshot_date: str,
     force: bool = False,
+    followers: int | None = None,
 ) -> dict:
     """수집한 게시물을 기존 줄에 합칩니다.
 
@@ -2776,6 +2783,7 @@ def merge_daily_posts(
       - 게시물 하나 = 줄 하나. 같은 글이 다시 잡혀도 새 줄을 만들지 않습니다.
       - 기록 창(D+0~D+2)을 벗어난 게시물은 건드리지 않습니다.
       - 이미 값이 있는 칸은 그대로 둡니다(--force 를 주면 덮어씁니다).
+      - 팔로워 수와 참여율은 '그 줄의 값을 실제로 갱신한 날' 기준으로 적습니다.
 
     돌려주는 값: 처리 결과 요약(dict)
     """
@@ -2807,6 +2815,8 @@ def merge_daily_posts(
             row = {
                 "계정": account_name,
                 "업로드일": upload_date,
+                "팔로워": "",
+                "참여율(%)": "",
                 "타입": post.get("타입", ""),
                 "본문": post.get("본문", ""),
                 "링크": post.get("링크", ""),
@@ -2832,8 +2842,17 @@ def merge_daily_posts(
             stats["snapshots_skipped"] += 1
             continue
 
-        row[like_column] = post.get("좋아요", "")
-        row[comment_column] = post.get("댓글", "")
+        likes = post.get("좋아요", "")
+        comments = post.get("댓글", "")
+        row[like_column] = likes
+        row[comment_column] = comments
+
+        # 팔로워 수와 참여율은 방금 적은 좋아요·댓글과 같은 시점의 값입니다.
+        # 값을 갱신한 날에만 함께 갱신해야 세 숫자의 시점이 어긋나지 않습니다.
+        if followers:
+            row["팔로워"] = followers
+            row["참여율(%)"] = calc_engagement_rate(likes, comments, followers)
+
         stats["snapshots_written"] += 1
 
     return stats
@@ -2962,7 +2981,7 @@ def run_daily_crawl(
         write_daily_log(log_path, "INFO", f"{account_name} (@{username})")
 
         try:
-            posts = collect_posts_for_snapshot(
+            posts, followers = collect_posts_for_snapshot(
                 username=username,
                 snapshot_date=snapshot,
                 session_file=session_file,
@@ -2974,6 +2993,15 @@ def run_daily_crawl(
             if duplicates:
                 write_daily_log(log_path, "INFO", f"  Duplicate posts removed: {duplicates}")
 
+            if followers:
+                write_daily_log(log_path, "INFO", f"  Followers: {followers:,}")
+            else:
+                write_daily_log(
+                    log_path,
+                    "INFO",
+                    "  Followers: 확인 실패 — 팔로워·참여율 칸은 비워 둡니다.",
+                )
+
             path = get_account_output_path(account_name, username, output_dir)
             rows, snapshot_days = load_daily_workbook(path)
 
@@ -2983,6 +3011,7 @@ def run_daily_crawl(
                 account_name=account_name,
                 snapshot_date=snapshot,
                 force=force,
+                followers=followers,
             )
 
             if stats["snapshots_written"]:
