@@ -1040,12 +1040,23 @@ https://docs.google.com/spreadsheets/d/1LegXkAh2qnuVBlPfg4KE1HdejD4aZlFRbWYX0kFD
 ### 9-3. 설정 — `sheets_config.json`
 
 한 번 실행하면 예시 파일이 자동으로 만들어집니다.
+브랜드·컬럼 대응표는 이미 채워져 있고, **시트 주소만 넣으면 됩니다.**
 
 ```bash
 python sheets_uploader.py
 ```
 
-메모장으로 열어 채웁니다.
+주소는 명령 한 줄로 넣을 수 있습니다. (메모장을 열지 않아도 됩니다)
+
+```bash
+python sheets_uploader.py --set-sheet "https://docs.google.com/spreadsheets/d/1mlGD.../edit"
+```
+
+> 메모장으로 직접 고쳐도 되지만, **저장할 때 인코딩이 `UTF-8` 인지 확인**하세요.
+> `ANSI` 로 저장하면 한글 브랜드 이름이 깨질 수 있습니다.
+> (프로그램이 두 인코딩을 모두 읽긴 하지만, UTF-8 로 두는 게 안전합니다)
+
+설정 파일 내용은 이렇습니다.
 
 ```json
 {

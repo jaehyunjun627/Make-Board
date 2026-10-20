@@ -109,11 +109,29 @@ def load_sheets_config(path: str = DEFAULT_CONFIG_FILE) -> dict:
             f"       메모장으로 열어 시트 ID와 올릴 내용을 채운 뒤 다시 실행해 주세요."
         )
 
+    # 메모장이 ANSI(CP949)로 저장하는 경우가 있어 두 가지 인코딩을 모두 시도합니다.
+    text = None
+    for encoding in ("utf-8-sig", "cp949"):
+        try:
+            with open(path, encoding=encoding) as f:
+                text = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if text is None:
+        raise UploadError(
+            f"'{path}' 의 글자 인코딩을 알 수 없습니다.\n"
+            f"       메모장에서 '다른 이름으로 저장' → 인코딩을 'UTF-8' 로 바꿔 저장해 주세요."
+        )
+
     try:
-        with open(path, encoding="utf-8") as f:
-            config = json.load(f)
+        config = json.loads(text)
     except json.JSONDecodeError as e:
-        raise UploadError(f"'{path}' 를 읽을 수 없습니다(형식 오류): {e}")
+        raise UploadError(
+            f"'{path}' 의 형식이 올바르지 않습니다 ({e.lineno}번째 줄): {e.msg}\n"
+            f"       쉼표나 따옴표가 빠지지 않았는지 확인해 주세요."
+        )
 
     spreadsheet_id = str(config.get("spreadsheet_id", "")).strip()
     if not spreadsheet_id or "여기에" in spreadsheet_id:
@@ -142,6 +160,37 @@ def extract_spreadsheet_id(value: str) -> str:
     text = str(value).strip()
     match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", text)
     return match.group(1) if match else text
+
+
+def set_spreadsheet_id(path: str, url_or_id: str) -> str:
+    """설정 파일에 시트 주소를 넣어 줍니다(메모장을 열지 않아도 되도록).
+
+    설정 파일이 없으면 예시를 먼저 만들고 주소만 채웁니다.
+    나머지 설정은 건드리지 않습니다.
+    """
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(SAMPLE_CONFIG, f, ensure_ascii=False, indent=2)
+
+    try:
+        config = load_sheets_config(path)
+    except UploadError:
+        # spreadsheet_id 가 비어 있어서 난 오류라면 그대로 진행합니다.
+        for encoding in ("utf-8-sig", "cp949"):
+            try:
+                with open(path, encoding=encoding) as f:
+                    config = json.load(f)
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        else:
+            raise
+
+    sheet_id = extract_spreadsheet_id(url_or_id)
+    config["spreadsheet_id"] = sheet_id
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    return sheet_id
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1138,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="실제로 올리지 않고 무엇이 올라갈지만 확인합니다(인증 없이도 됩니다).",
     )
     parser.add_argument(
+        "--set-sheet",
+        metavar="주소",
+        help="설정 파일에 구글 시트 주소를 넣고 끝냅니다. (메모장을 열지 않아도 됩니다)",
+    )
+    parser.add_argument(
         "--month",
         action="append",
         help="이 달만 처리합니다 (예: --month 2026-10). 여러 번 쓸 수 있습니다.",
@@ -1104,6 +1158,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.set_sheet:
+            sheet_id = set_spreadsheet_id(args.config, args.set_sheet)
+            print(f"[완료] '{args.config}' 에 시트를 지정했습니다.")
+            print(f"       시트 ID: {sheet_id}")
+            print(f"       이제 'python sheets_uploader.py --dry-run' 으로 확인해 보세요.")
+            return 0
+
         return run_sheets_upload(
             config_file=args.config,
             log_dir=args.log_dir,
