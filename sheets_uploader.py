@@ -40,7 +40,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,7 @@ SAMPLE_CONFIG = {
             "월 콘텐츠 수": "F",
             "인게이지먼트": "G",
         },
+        "period_start_day": 16,
         "months": "auto",
     },
     # --- (선택) 표를 통째로 올리고 싶을 때 ------------------------------------
@@ -788,24 +789,71 @@ def last_snapshot_engagement(row: dict) -> tuple[int, int] | None:
     return likes, comments or 0
 
 
+def last_day_of_month(month: str) -> str:
+    """'2026-02' → '2026-02-28'. 그 달의 마지막 날을 구합니다."""
+    year, number = month.split("-")
+    next_month = shift_month(month, 1)
+    next_year, next_number = next_month.split("-")
+    first_of_next = date(int(next_year), int(next_number), 1)
+    return (first_of_next - timedelta(days=1)).isoformat()
+
+
+def report_period(month: str, start_day: int = 1) -> tuple[str, str]:
+    """보고 기간의 (시작일, 종료일) 을 구합니다.
+
+    start_day 가 1 이면 달력 그대로 (1일 ~ 말일).
+    start_day 가 16 이면 '전월 16일 ~ 당월 15일' 이 됩니다.
+
+      report_period("2026-10", 16) → ("2026-09-16", "2026-10-15")
+
+    회사마다 집계 구간이 다르므로 설정으로 바꿀 수 있게 해 두었습니다.
+    """
+    if start_day <= 1:
+        return f"{month}-01", last_day_of_month(month)
+
+    previous = shift_month(month, -1)
+    return f"{previous}-{start_day:02d}", f"{month}-{start_day - 1:02d}"
+
+
 def aggregate_monthly_metrics(
     followers_history: str,
     daily_crawl_dir: str,
     brand_map: dict[str, str],
+    period_start_day: int = 1,
 ) -> dict[tuple[str, str], dict[str, int]]:
-    """수집 결과를 (월, 브랜드)별 월간 지표로 묶습니다.
+    """수집 결과를 (보고월, 브랜드)별 지표로 묶습니다.
 
     brand_map 은 accounts.csv 의 이름 → 시트의 브랜드 이름 대응표입니다.
       예) {"BMW 모토라드 코리아": "모토라드"}
+
+    period_start_day 로 집계 구간을 정합니다.
+      1  → 달력 그대로 (10월 = 10/1 ~ 10/31)
+      16 → 전월 16일 ~ 당월 15일 (10월 = 9/16 ~ 10/15)
 
     돌려주는 값
       {("2026-10", "모토라드"): {"총 팔로워 수": 31639, "월 콘텐츠 수": 20, ...}}
     """
     result: dict[tuple[str, str], dict[str, int]] = {}
 
-    # --- 1) 총 팔로워 수: 그 달 '마지막 기록일' 의 값 ------------------------
-    # 월 중간 값이 아니라 월말 기준이어야 달끼리 비교가 됩니다.
-    latest_by_month: dict[tuple[str, str], tuple[str, int]] = {}
+    # 어떤 보고월들을 만들지 먼저 정합니다.
+    # 자료에 등장하는 날짜가 어느 보고월에 속하는지 거꾸로 찾아야 하므로,
+    # 날짜 → 보고월 변환표를 미리 만들어 둡니다.
+    def month_for(day: str) -> str:
+        """그 날짜가 속한 '보고월' 을 구합니다."""
+        if not day:
+            return ""
+        calendar_month = month_of(day)
+        if not calendar_month or period_start_day <= 1:
+            return calendar_month
+        # 16일 이후면 다음 달 보고분입니다.
+        try:
+            number = int(day[8:10])
+        except (ValueError, IndexError):
+            return calendar_month
+        return shift_month(calendar_month, 1) if number >= period_start_day else calendar_month
+
+    # --- 1) 총 팔로워 수: 보고 기간 안의 '마지막 기록일' 값 -------------------
+    latest_by_period: dict[tuple[str, str], tuple[str, int]] = {}
     if os.path.exists(followers_history):
         _header, records = read_csv_rows(followers_history)
         for record in records:
@@ -813,29 +861,31 @@ def aggregate_monthly_metrics(
             if not brand:
                 continue  # 시트에 없는 계정은 건너뜁니다.
             day = str(record.get("date", "")).strip()
-            month = month_of(day)
+            month = month_for(day)
             followers = to_number(record.get("followers"))
             if not month or followers is None:
                 continue
 
             key = (month, brand)
-            previous = latest_by_month.get(key)
+            previous = latest_by_period.get(key)
             if previous is None or day >= previous[0]:
-                latest_by_month[key] = (day, followers)
+                latest_by_period[key] = (day, followers)
 
-    for key, (_day, followers) in latest_by_month.items():
+    for key, (_day, followers) in latest_by_period.items():
         result.setdefault(key, {})[METRIC_TOTAL_FOLLOWERS] = followers
 
-    # --- 2) 신규 팔로워 수 = 이번 달 − 지난 달 -------------------------------
-    # 지난 달 기록이 우리에게 없으면 여기서는 비워 둡니다.
+    # --- 2) 신규 팔로워 수 = 이번 기간 − 지난 기간 ---------------------------
+    # 지난 기간 기록이 우리에게 없으면 비워 둡니다.
     # (그 경우엔 뒤에서 시트에 적힌 지난 달 값을 보고 채웁니다)
     for (month, brand), values in result.items():
-        previous_month = shift_month(month, -1)
-        previous = latest_by_month.get((previous_month, brand))
+        previous = latest_by_period.get((shift_month(month, -1), brand))
         if previous is not None:
             values[METRIC_NEW_FOLLOWERS] = values[METRIC_TOTAL_FOLLOWERS] - previous[1]
 
     # --- 3) 월 콘텐츠 수 · 인게이지먼트 --------------------------------------
+    # 인게이지먼트는 '좋아요·댓글이 실제로 기록된 글' 만 더할 수 있습니다.
+    # 기록이 없는 글이 섞이면 합계가 실제보다 작아지므로, 몇 건을 더했는지
+    # 함께 세어 두었다가 로그로 알려 줍니다.
     pattern = os.path.join(daily_crawl_dir, "*.xlsx")
     for path in sorted(glob.glob(pattern)):
         _header, rows = read_xlsx_rows(path)
@@ -843,7 +893,8 @@ def aggregate_monthly_metrics(
             brand = brand_map.get(str(row.get("계정", "")).strip())
             if not brand:
                 continue
-            month = month_of(row.get("업로드일"))
+            day = str(row.get("업로드일", "")).strip()
+            month = month_for(day)
             if not month:
                 continue
 
@@ -857,6 +908,7 @@ def aggregate_monthly_metrics(
                 values[METRIC_ENGAGEMENT] = (
                     values.get(METRIC_ENGAGEMENT, 0) + likes + comments
                 )
+                values["_인게이지먼트_집계글수"] = values.get("_인게이지먼트_집계글수", 0) + 1
 
     return result
 
@@ -1046,10 +1098,21 @@ def run_monthly_report(
 
     write_upload_log(log_path, "INFO", "월간 지표 표 채우기")
 
+    period_start_day = int(settings.get("period_start_day", 1))
+    if period_start_day <= 1:
+        write_upload_log(log_path, "INFO", "  집계 구간: 달력 기준 (1일 ~ 말일)")
+    else:
+        write_upload_log(
+            log_path,
+            "INFO",
+            f"  집계 구간: 전월 {period_start_day}일 ~ 당월 {period_start_day - 1}일",
+        )
+
     metrics = aggregate_monthly_metrics(
         followers_history=settings.get("followers_history", "followers_history.csv"),
         daily_crawl_dir=settings.get("daily_crawl_dir", "Daily_crawl"),
         brand_map=brand_map,
+        period_start_day=period_start_day,
     )
     if not metrics:
         write_upload_log(log_path, "INFO", "  집계할 자료가 없습니다.")
@@ -1062,10 +1125,24 @@ def run_monthly_report(
     for (month, brand) in sorted(metrics):
         if target_months and month not in target_months:
             continue
+        values = metrics[(month, brand)]
+        start, end = report_period(month, period_start_day)
         summary = ", ".join(
-            f"{k} {v:,}" for k, v in metrics[(month, brand)].items()
+            f"{k} {v:,}" for k, v in values.items() if not k.startswith("_")
         )
-        write_upload_log(log_path, "INFO", f"  {month} / {brand}: {summary}")
+        write_upload_log(log_path, "INFO", f"  {month} ({start}~{end}) / {brand}: {summary}")
+
+        # 좋아요·댓글이 기록되지 않은 글이 있으면 인게이지먼트가 실제보다 작습니다.
+        # 조용히 넘어가면 숫자를 믿어버리게 되므로 분명히 알려 줍니다.
+        total_posts = values.get(METRIC_POST_COUNT, 0)
+        counted = values.get("_인게이지먼트_집계글수", 0)
+        if total_posts and counted < total_posts:
+            write_upload_log(
+                log_path,
+                "INFO",
+                f"    [주의] 글 {total_posts}건 중 {counted}건만 좋아요·댓글 기록이 있어 "
+                f"인게이지먼트가 실제보다 작습니다.",
+            )
 
     if dry_run:
         write_upload_log(
