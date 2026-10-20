@@ -83,6 +83,7 @@ SAMPLE_CONFIG = {
             "인게이지먼트": "G",
         },
         "period_start_day": 16,
+        "timestamp_column": "A",
         "months": "auto",
     },
     # --- (선택) 표를 통째로 올리고 싶을 때 ------------------------------------
@@ -843,6 +844,9 @@ MONTHLY_METRICS = [
 ]
 
 # 'YYYY-MM' 형태인지 확인할 때 씁니다.
+# 집계 시각을 적을 때 쓰는 형식
+DEFAULT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+
 MONTH_PATTERN = re.compile(r"^(\d{4})[-/.](\d{1,2})")
 
 # Daily_crawl 엑셀의 날짜별 컬럼 이름 (예: '2026-10-20 좋아요')
@@ -1113,6 +1117,8 @@ def build_monthly_updates(
     columns: dict[str, str],
     months: list[str] | None = None,
     overwrite: bool = False,
+    timestamp_column: str | None = None,
+    timestamp_format: str = DEFAULT_TIMESTAMP_FORMAT,
 ) -> tuple[list[dict], list[str]]:
     """실제로 고쳐 쓸 칸 목록을 만듭니다.
 
@@ -1121,10 +1127,14 @@ def build_monthly_updates(
     - 지난 달 기록이 없어 신규 팔로워를 못 구한 경우, 시트에 적힌 지난 달
       '총 팔로워 수' 를 보고 계산합니다. 수기로 채워 둔 과거와 자연스럽게
       이어지게 하기 위함입니다.
+    - timestamp_column 을 주면 '언제 채웠는지' 를 그 열에 적습니다.
+      값이 실제로 바뀐 달에만 적고, 그 달의 첫 줄 한 곳에만 적습니다.
+      (집계 칸은 보통 달 단위로 병합되어 있어 첫 줄이 기준이 됩니다)
     """
     safe_title = sheet_title.replace("'", "''")
     updates: list[dict] = []
     notes: list[str] = []
+    touched_months: set[str] = set()
 
     for (month, brand) in sorted(metrics):
         if months and month not in months:
@@ -1170,6 +1180,26 @@ def build_monthly_updates(
                     "values": [[values[metric]]],
                 }
             )
+            touched_months.add(month)
+
+    # --- 집계 시각 적기 -----------------------------------------------------
+    # 값이 실제로 바뀐 달에만 적습니다. 아무것도 안 바뀐 달에 시각만 새로 찍히면
+    # 자료가 갱신된 것처럼 보여 오해를 부릅니다.
+    if timestamp_column and touched_months:
+        stamp = datetime.now().strftime(timestamp_format)
+        for month in sorted(touched_months):
+            month_rows = [row for (m, _b), row in rows.items() if m == month]
+            if not month_rows:
+                continue
+            # 그 달 묶음의 첫 줄에만 적습니다(병합된 칸이면 거기가 기준입니다).
+            first_row = min(month_rows)
+            updates.append(
+                {
+                    "range": f"'{safe_title}'!{timestamp_column.upper()}{first_row}",
+                    "values": [[stamp]],
+                }
+            )
+            notes.append(f"{month}: 집계 시각 {stamp} 기록")
 
     return updates, notes
 
@@ -1317,6 +1347,8 @@ def run_monthly_report(
         columns=columns,
         months=target_months,
         overwrite=overwrite or bool(settings.get("overwrite")),
+        timestamp_column=settings.get("timestamp_column"),
+        timestamp_format=settings.get("timestamp_format", DEFAULT_TIMESTAMP_FORMAT),
     )
     for note in notes:
         write_upload_log(log_path, "INFO", f"  {note}")
