@@ -7,3 +7,7 @@ openpyxl>=3.1.0
 
 # crawl / login 명령(브라우저 직접 수집)을 쓰려면 필요합니다.
 playwright>=1.44.0
+
+# 구글 시트 자동 업로드(sheets_uploader.py)를 쓰려면 필요합니다.
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
