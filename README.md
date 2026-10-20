@@ -1024,7 +1024,17 @@ https://docs.google.com/spreadsheets/d/1LegXkAh2qnuVBlPfg4KE1HdejD4aZlFRbWYX0kFD
 내려받은 파일 이름을 **`google_credentials.json`** 으로 바꿔 이 폴더에 둡니다.
 
 > ⚠️ **이 파일은 비밀번호와 같습니다.** 누구에게도 보내지 마세요.
-> `.gitignore` 에 등록해 두었으니 깃에 올라가지는 않습니다.
+>
+> **깃에는 올라가지 않습니다.** 이 폴더의 `.json` 은 전부 `.gitignore` 로 막아두었습니다.
+> 구글이 주는 원래 파일명(`sns-report-auto-1a2b3c.json`)을 그대로 둬도 안전합니다.
+> 직접 확인하시려면:
+>
+> ```bash
+> git check-ignore -v google_credentials.json      # 무시 규칙이 출력되면 안전
+> git status                                        # 목록에 안 나오면 안전
+> ```
+>
+> **`.gitignore` 는 파일을 지우지 않습니다.** 내 PC에는 그대로 남고, 깃에만 안 올라갑니다.
 
 **6단계 — 시트에 권한 주기 (빠뜨리기 쉬움)**
 `google_credentials.json` 을 메모장으로 열면 이런 줄이 있습니다.

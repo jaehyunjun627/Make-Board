@@ -21,10 +21,19 @@ dataset_*.json
 Daily_crawl/
 logs/
 
-# 구글 서비스 계정 키 (절대 공유·커밋 금지)
-google_credentials.json
-*credentials*.json
-service_account*.json
+# ---------------------------------------------------------------------------
+# 비밀 정보 — 절대 커밋되면 안 되는 것들
+# ---------------------------------------------------------------------------
+# 구글에서 내려받은 서비스 계정 키는 파일 이름이 제각각입니다.
+#   google_credentials.json / sns-report-auto-1a2b3c.json / my-key (1).json ...
+# 이름으로 하나씩 막으면 반드시 빠지는 게 생기므로,
+# 이 폴더의 .json 은 모두 막고 필요한 것만 따로 허용합니다.
+# (추적해야 할 json 이 생기면  git add -f 파일명  으로 넣으세요)
+*.json
 
-# 시트 업로드 설정 (시트 ID가 들어갑니다)
-sheets_config.json
+# 혹시 하위 폴더에 두더라도 막습니다.
+**/*credentials*.json
+**/service_account*.json
+**/*-service-account*.json
+
+# 로그인 세션 쿠키
