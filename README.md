@@ -1021,7 +1021,24 @@ https://docs.google.com/spreadsheets/d/1LegXkAh2qnuVBlPfg4KE1HdejD4aZlFRbWYX0kFD
 → 파일이 자동으로 내려받아집니다.
 
 **5단계 — 키 파일 옮기기**
-내려받은 파일 이름을 **`google_credentials.json`** 으로 바꿔 이 폴더에 둡니다.
+내려받은 파일을 이 폴더에 두세요. 이름은 **`google_credentials.json`** 을 권하지만,
+**바꾸지 않아도 됩니다.** 프로그램이 폴더의 `.json` 을 열어보고 키 파일을 알아서 찾습니다.
+
+```text
+[정보] 키 파일을 찾았습니다: sns-report-auto-1a2b3c.json
+```
+
+여러 개가 있어 헷갈릴 때는 직접 지정할 수 있습니다.
+
+```bash
+python sheets_uploader.py --credentials "sns-report-auto-1a2b3c.json"
+```
+
+> **윈도우 확장자 숨김 주의**
+> 확장자가 숨겨진 상태에서 이름을 `google_credentials.json` 으로 바꾸면
+> 실제 파일명이 **`google_credentials.json.json`** 이 되어 버립니다.
+> 탐색기 `보기 → 파일 확장명` 을 켜서 확인하세요.
+> (이 경우에도 프로그램이 자동으로 찾아내긴 합니다)
 
 > ⚠️ **이 파일은 비밀번호와 같습니다.** 누구에게도 보내지 마세요.
 >

@@ -311,14 +311,83 @@ def sort_rows(rows: list[dict], sort_by: str | None, descending: bool = False) -
 # ---------------------------------------------------------------------------
 
 
+def looks_like_service_account(path: str) -> bool:
+    """그 파일이 구글 서비스 계정 키인지 내용을 보고 판단합니다."""
+    try:
+        if os.path.getsize(path) > 64_000:
+            return False  # 키 파일은 보통 2~3KB 입니다.
+        for encoding in ("utf-8-sig", "cp949"):
+            try:
+                with open(path, encoding=encoding) as f:
+                    data = json.load(f)
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        else:
+            return False
+    except OSError:
+        return False
+
+    return (
+        isinstance(data, dict)
+        and data.get("type") == "service_account"
+        and "client_email" in data
+        and "private_key" in data
+    )
+
+
+def find_service_account_file(preferred: str) -> tuple[str | None, list[str]]:
+    """서비스 계정 키 파일을 찾습니다.
+
+    정해둔 이름(google_credentials.json)이 있으면 그걸 씁니다.
+    없으면 같은 폴더의 .json 을 열어보고 서비스 계정 키인 것을 찾아냅니다.
+
+    구글이 내려주는 파일 이름이 제각각이고(sns-report-auto-1a2b3c.json),
+    윈도우가 확장자를 숨긴 상태로 이름을 바꾸면 google_credentials.json.json
+    처럼 되기도 해서, 이름에 기대지 않고 내용으로 찾습니다.
+
+    돌려주는 값: (찾은 파일 또는 None, 후보로 본 json 파일 목록)
+    """
+    if os.path.exists(preferred) and looks_like_service_account(preferred):
+        return preferred, []
+
+    folder = os.path.dirname(os.path.abspath(preferred)) or "."
+    candidates = sorted(glob.glob(os.path.join(folder, "*.json")))
+    found = [p for p in candidates if looks_like_service_account(p)]
+
+    if len(found) == 1:
+        return found[0], candidates
+    return None, candidates
+
+
 def build_sheets_service(credentials_file: str):
-    """서비스 계정 키로 구글 시트에 접속할 준비를 합니다."""
-    if not os.path.exists(credentials_file):
+    """서비스 계정 키로 구글 시트에 접속할 준비를 합니다.
+
+    정해둔 이름이 없으면 같은 폴더에서 키 파일을 찾아봅니다.
+    """
+    resolved, candidates = find_service_account_file(credentials_file)
+
+    if resolved is None:
+        others = [os.path.basename(p) for p in candidates]
+        extra = ""
+        if others:
+            extra = (
+                f"\n       이 폴더에 있는 .json 파일: {', '.join(others)}\n"
+                f"       이 중에 키 파일이 있다면 --credentials 로 지정해 주세요."
+            )
         raise UploadError(
-            f"구글 인증 파일('{credentials_file}')이 없습니다.\n"
-            f"       구글 클라우드에서 서비스 계정 키(JSON)를 받아 이 이름으로 두세요.\n"
-            f"       자세한 순서는 README 의 '구글 시트 자동 업로드' 부분을 보세요."
+            f"구글 서비스 계정 키 파일을 찾지 못했습니다.\n"
+            f"       찾아본 이름: {credentials_file}\n"
+            f"       구글 클라우드에서 받은 JSON 키를 이 폴더에 두세요."
+            f"{extra}\n"
+            f"       (윈도우에서 확장자를 숨긴 채 이름을 바꾸면 'google_credentials.json.json'\n"
+            f"        처럼 되는 경우가 있습니다. 보기 → 파일 확장명 을 켜서 확인해 보세요)"
         )
+
+    if os.path.abspath(resolved) != os.path.abspath(credentials_file):
+        print(f"[정보] 키 파일을 찾았습니다: {os.path.basename(resolved)}")
+
+    credentials_file = resolved
 
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -336,11 +405,19 @@ def build_sheets_service(credentials_file: str):
 
 def service_account_email(credentials_file: str) -> str:
     """오류 안내에 쓸 서비스 계정 이메일을 읽어 둡니다."""
-    try:
-        with open(credentials_file, encoding="utf-8") as f:
-            return json.load(f).get("client_email", "(알 수 없음)")
-    except Exception:
+    resolved, _candidates = find_service_account_file(credentials_file)
+    if resolved is None:
         return "(알 수 없음)"
+    try:
+        for encoding in ("utf-8-sig", "cp949"):
+            try:
+                with open(resolved, encoding=encoding) as f:
+                    return json.load(f).get("client_email", "(알 수 없음)")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+    except OSError:
+        pass
+    return "(알 수 없음)"
 
 
 def build_sheets_service_readonly(api_key: str):
@@ -593,6 +670,7 @@ def run_sheets_upload(
     months: list[str] | None = None,
     overwrite: bool = False,
     api_key: str | None = None,
+    credentials_override: str | None = None,
 ) -> int:
     """설정에 적힌 내용을 전부 구글 시트에 올립니다.
 
@@ -618,6 +696,8 @@ def run_sheets_upload(
         write_upload_log(log_path, "INFO", "Dry run — 실제 기록 없음")
 
     config = load_sheets_config(config_file)
+    if credentials_override:
+        config["credentials_file"] = credentials_override
     spreadsheet_id = extract_spreadsheet_id(config["spreadsheet_id"])
     credentials_file = config.get("credentials_file", DEFAULT_CREDENTIALS_FILE)
     uploads = config.get("uploads") or []
@@ -1289,6 +1369,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="실제로 올리지 않고 무엇이 올라갈지만 확인합니다(인증 없이도 됩니다).",
     )
     parser.add_argument(
+        "--credentials",
+        help=f"서비스 계정 키 파일 경로 (기본: {DEFAULT_CREDENTIALS_FILE}, 못 찾으면 폴더에서 자동 탐색)",
+    )
+    parser.add_argument(
         "--api-key",
         help=(
             "API 키로 실제 시트를 읽어 설정이 맞는지 검증합니다 (--dry-run 과 함께). "
@@ -1333,6 +1417,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         return run_sheets_upload(
+            credentials_override=args.credentials,
             config_file=args.config,
             log_dir=args.log_dir,
             dry_run=args.dry_run,
