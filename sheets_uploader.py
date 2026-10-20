@@ -84,6 +84,7 @@ SAMPLE_CONFIG = {
         },
         "period_start_day": 16,
         "timestamp_column": "A",
+        "refresh_months": 1,
         "months": "auto",
     },
     # --- (선택) 표를 통째로 올리고 싶을 때 ------------------------------------
@@ -915,6 +916,48 @@ def last_snapshot_engagement(row: dict) -> tuple[int, int] | None:
     return likes, comments or 0
 
 
+def report_month_of(day: str, period_start_day: int = 1) -> str:
+    """그 날짜가 속한 '보고월' 을 구합니다.
+
+    period_start_day 가 16 이면 10월 16일은 11월 보고분에 들어갑니다.
+    """
+    if not day:
+        return ""
+    calendar_month = month_of(day)
+    if not calendar_month or period_start_day <= 1:
+        return calendar_month
+    try:
+        number = int(str(day)[8:10])
+    except (ValueError, IndexError):
+        return calendar_month
+    return shift_month(calendar_month, 1) if number >= period_start_day else calendar_month
+
+
+def current_report_month(period_start_day: int = 1, today: str | None = None) -> str:
+    """오늘이 속한 보고월. 아직 집계가 끝나지 않은 달입니다."""
+    day = today or datetime.now().strftime("%Y-%m-%d")
+    return report_month_of(day, period_start_day)
+
+
+def months_to_refresh(
+    period_start_day: int = 1,
+    count: int = 1,
+    today: str | None = None,
+) -> set[str]:
+    """매일 다시 채워도 되는 보고월들을 구합니다.
+
+    아직 기간이 끝나지 않은 달은 숫자가 계속 변하므로 매일 갱신해야 합니다.
+    반대로 이미 끝난 달은 값이 확정되었고 수기로 적어 둔 것도 있어서
+    함부로 덮어쓰면 안 됩니다. 그래서 '최근 count 개' 만 갱신 대상으로 둡니다.
+    """
+    if count <= 0:
+        return set()
+    current = current_report_month(period_start_day, today)
+    if not current:
+        return set()
+    return {shift_month(current, -offset) for offset in range(count)}
+
+
 def last_day_of_month(month: str) -> str:
     """'2026-02' → '2026-02-28'. 그 달의 마지막 날을 구합니다."""
     year, number = month.split("-")
@@ -965,18 +1008,7 @@ def aggregate_monthly_metrics(
     # 자료에 등장하는 날짜가 어느 보고월에 속하는지 거꾸로 찾아야 하므로,
     # 날짜 → 보고월 변환표를 미리 만들어 둡니다.
     def month_for(day: str) -> str:
-        """그 날짜가 속한 '보고월' 을 구합니다."""
-        if not day:
-            return ""
-        calendar_month = month_of(day)
-        if not calendar_month or period_start_day <= 1:
-            return calendar_month
-        # 16일 이후면 다음 달 보고분입니다.
-        try:
-            number = int(day[8:10])
-        except (ValueError, IndexError):
-            return calendar_month
-        return shift_month(calendar_month, 1) if number >= period_start_day else calendar_month
+        return report_month_of(day, period_start_day)
 
     # --- 1) 총 팔로워 수: 보고 기간 안의 '마지막 기록일' 값 -------------------
     latest_by_period: dict[tuple[str, str], tuple[str, int]] = {}
@@ -1119,6 +1151,7 @@ def build_monthly_updates(
     overwrite: bool = False,
     timestamp_column: str | None = None,
     timestamp_format: str = DEFAULT_TIMESTAMP_FORMAT,
+    refresh_months: set[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """실제로 고쳐 쓸 칸 목록을 만듭니다.
 
@@ -1127,6 +1160,9 @@ def build_monthly_updates(
     - 지난 달 기록이 없어 신규 팔로워를 못 구한 경우, 시트에 적힌 지난 달
       '총 팔로워 수' 를 보고 계산합니다. 수기로 채워 둔 과거와 자연스럽게
       이어지게 하기 위함입니다.
+    - refresh_months 에 든 달은 이미 값이 있어도 다시 씁니다. 아직 기간이
+      끝나지 않은 달은 숫자가 매일 달라지므로 갱신해야 하기 때문입니다.
+      끝난 달은 손대지 않습니다(수기로 적어 둔 과거를 지키기 위해서입니다).
     - timestamp_column 을 주면 '언제 채웠는지' 를 그 열에 적습니다.
       값이 실제로 바뀐 달에만 적고, 그 달의 첫 줄 한 곳에만 적습니다.
       (집계 칸은 보통 달 단위로 병합되어 있어 첫 줄이 기준이 됩니다)
@@ -1167,8 +1203,9 @@ def build_monthly_updates(
             if metric not in values:
                 continue
 
+            may_overwrite = overwrite or (refresh_months and month in refresh_months)
             existing = sheet_cell_value(grid, row_number, letter)
-            if existing not in ("", None) and not overwrite:
+            if existing not in ("", None) and not may_overwrite:
                 notes.append(
                     f"{month} / {brand} / {metric}: 이미 값({existing})이 있어 그대로 둠"
                 )
@@ -1339,6 +1376,15 @@ def run_monthly_report(
     )
     write_upload_log(log_path, "INFO", f"  '{sheet_title}' 에서 {len(rows)}개 줄을 찾았습니다.")
 
+    # 아직 끝나지 않은 보고월은 매일 다시 채웁니다.
+    # (끝난 달까지 덮어쓰면 수기로 적어 둔 과거가 사라집니다)
+    refresh_count = int(settings.get("refresh_months", 1))
+    refreshable = months_to_refresh(period_start_day, refresh_count)
+    if refreshable:
+        write_upload_log(
+            log_path, "INFO", f"  매일 갱신 대상: {', '.join(sorted(refreshable))}"
+        )
+
     updates, notes = build_monthly_updates(
         metrics=metrics,
         rows=rows,
@@ -1347,6 +1393,7 @@ def run_monthly_report(
         columns=columns,
         months=target_months,
         overwrite=overwrite or bool(settings.get("overwrite")),
+        refresh_months=refreshable,
         timestamp_column=settings.get("timestamp_column"),
         timestamp_format=settings.get("timestamp_format", DEFAULT_TIMESTAMP_FORMAT),
     )
