@@ -59,24 +59,34 @@ CELL_PATTERN = re.compile(r"^([A-Za-z]+)([0-9]+)$")
 
 # 설정 파일이 없을 때 만들어 줄 예시
 SAMPLE_CONFIG = {
-    "spreadsheet_id": "여기에_시트_주소의_ID를_넣으세요",
+    "spreadsheet_id": "여기에_시트_주소를_통째로_붙여넣으세요",
     "credentials_file": DEFAULT_CREDENTIALS_FILE,
-    "uploads": [
-        {
-            "name": "팔로워 기록",
-            "source": "followers_history.csv",
-            "sheet": "시트5",
-            "start_cell": "A2",
-            "mode": "replace",
-            "columns": [
-                "date",
-                "account_name",
-                "followers",
-                "daily_change",
-                "daily_change_rate",
-            ],
-        }
-    ],
+    # --- 월간 지표 표 채우기 -------------------------------------------------
+    # (월, 브랜드) 가 맞는 줄을 찾아 아래 columns 에 적은 칸만 고쳐 씁니다.
+    # 시트에 이미 값이 있는 칸은 건드리지 않습니다.
+    "monthly_report": {
+        "sheet": "경쟁사 Instagram 월간 지표",
+        "month_column": "B",
+        "brand_column": "C",
+        "followers_history": "followers_history.csv",
+        "daily_crawl_dir": "Daily_crawl",
+        "brands": {
+            "BMW 모토라드 코리아": "모토라드",
+            "할리데이비슨 코리아": "할리데이비슨",
+            "트라이엄프 코리아": "트라이엄프",
+            "로얄엔필드 코리아": "로얄엔필드",
+        },
+        "columns": {
+            "총 팔로워 수": "D",
+            "신규 팔로워 수": "E",
+            "월 콘텐츠 수": "F",
+            "인게이지먼트": "G",
+        },
+        "months": "auto",
+    },
+    # --- (선택) 표를 통째로 올리고 싶을 때 ------------------------------------
+    # 필요 없으면 uploads 를 통째로 지워도 됩니다.
+    "uploads": [],
 }
 
 
@@ -113,8 +123,13 @@ def load_sheets_config(path: str = DEFAULT_CONFIG_FILE) -> dict:
         )
 
     uploads = config.get("uploads")
-    if not isinstance(uploads, list) or not uploads:
-        raise UploadError(f"'{path}' 의 uploads 가 비어 있습니다. 올릴 내용을 한 개 이상 적어 주세요.")
+    monthly = config.get("monthly_report")
+    has_uploads = isinstance(uploads, list) and uploads
+    if not has_uploads and not monthly:
+        raise UploadError(
+            f"'{path}' 에 올릴 내용이 없습니다.\n"
+            f"       uploads(표 통째로) 또는 monthly_report(월간 지표 표) 중 하나는 적어 주세요."
+        )
 
     return config
 
@@ -443,8 +458,14 @@ def run_sheets_upload(
     config_file: str = DEFAULT_CONFIG_FILE,
     log_dir: str = DEFAULT_LOG_DIR,
     dry_run: bool = False,
+    months: list[str] | None = None,
+    overwrite: bool = False,
 ) -> int:
     """설정에 적힌 내용을 전부 구글 시트에 올립니다.
+
+    설정에 담을 수 있는 것은 두 가지입니다.
+      uploads        : 표를 통째로 올리기 (범위를 비우고 다시 쓰기)
+      monthly_report : 월간 지표 표의 해당 칸만 고쳐 쓰기
 
     항목 하나가 실패해도 나머지는 계속 진행합니다.
     돌려주는 값: 종료 코드(0=전부 성공, 1=하나라도 실패)
@@ -466,7 +487,7 @@ def run_sheets_upload(
     config = load_sheets_config(config_file)
     spreadsheet_id = extract_spreadsheet_id(config["spreadsheet_id"])
     credentials_file = config.get("credentials_file", DEFAULT_CREDENTIALS_FILE)
-    uploads = config["uploads"]
+    uploads = config.get("uploads") or []
 
     write_upload_log(log_path, "INFO", f"Spreadsheet: {spreadsheet_id}")
 
@@ -543,6 +564,24 @@ def run_sheets_upload(
             write_upload_log(log_path, "ERROR", f"{name}: {type(e).__name__}: {e}")
             failed.append((name, f"{type(e).__name__}: {e}"))
 
+    # --- 월간 지표 표 (설정에 있을 때만) ------------------------------------
+    if config.get("monthly_report"):
+        try:
+            run_monthly_report(
+                config,
+                log_path,
+                dry_run=dry_run,
+                months=months,
+                overwrite=overwrite,
+            )
+            succeeded += 1
+        except UploadError as e:
+            write_upload_log(log_path, "ERROR", f"월간 지표 표: {e}")
+            failed.append(("월간 지표 표", str(e)))
+        except Exception as e:
+            write_upload_log(log_path, "ERROR", f"월간 지표 표: {type(e).__name__}: {e}")
+            failed.append(("월간 지표 표", f"{type(e).__name__}: {e}"))
+
     write_upload_log(log_path, "INFO", "Sheets upload completed")
     write_upload_log(log_path, "INFO", f"Success: {succeeded}")
     write_upload_log(log_path, "INFO", f"Failed: {len(failed)}")
@@ -556,6 +595,423 @@ def run_sheets_upload(
     print("=" * 56)
 
     return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# 5단계: 월간 지표 시트 채우기 (monthly_report)
+# ---------------------------------------------------------------------------
+#
+#  어떤 시트를 대상으로 하나
+#    '경쟁사 Instagram 월간 지표' 처럼 월 × 브랜드로 줄이 짜여 있고,
+#    달마다 같은 브랜드 묶음이 반복되는 표입니다.
+#
+#      집계 | 월       | 브랜드      | 총 팔로워 수 | 신규 팔로워 수 | 월 콘텐츠 수 | 인게이지먼트 | ...
+#      완료 | 2026-10 | 모토라드    | 31,639      | 441          | 20          | 2,410       |
+#
+#  왜 '범위를 통째로 덮어쓰기' 를 쓰지 않나
+#    그 방식은 지정한 범위를 먼저 비웁니다. 이번 달 값만 올리면서 범위를
+#    지우면 수기로 채워 둔 지난 달들이 전부 날아갑니다.
+#    그래서 여기서는 (월, 브랜드) 가 맞는 줄을 찾아 '그 칸들만' 고쳐 씁니다.
+#
+#  줄을 어떻게 찾나
+#    행 번호를 외워 두지 않고, 시트의 월 칸과 브랜드 칸을 읽어서 맞춰봅니다.
+#    줄이 밀리거나 달 묶음이 늘어나도 그대로 동작합니다.
+#    맞는 줄이 없으면 건너뛰고 기록만 남깁니다 (줄을 새로 만들지 않습니다).
+
+# 월간 표에 채울 수 있는 지표들
+METRIC_TOTAL_FOLLOWERS = "총 팔로워 수"
+METRIC_NEW_FOLLOWERS = "신규 팔로워 수"
+METRIC_POST_COUNT = "월 콘텐츠 수"
+METRIC_ENGAGEMENT = "인게이지먼트"
+
+MONTHLY_METRICS = [
+    METRIC_TOTAL_FOLLOWERS,
+    METRIC_NEW_FOLLOWERS,
+    METRIC_POST_COUNT,
+    METRIC_ENGAGEMENT,
+]
+
+# 'YYYY-MM' 형태인지 확인할 때 씁니다.
+MONTH_PATTERN = re.compile(r"^(\d{4})[-/.](\d{1,2})")
+
+# Daily_crawl 엑셀의 날짜별 컬럼 이름 (예: '2026-10-20 좋아요')
+SNAPSHOT_LIKE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*좋아요$")
+SNAPSHOT_COMMENT_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*댓글$")
+
+
+def month_of(value: Any) -> str:
+    """날짜 비슷한 값을 'YYYY-MM' 으로 통일합니다.
+
+    '2026-10-20' / '2026-10' / datetime / '2026.10' 모두 '2026-10' 이 됩니다.
+    알아볼 수 없으면 빈 문자열을 돌려줍니다.
+    """
+    if value in (None, ""):
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m")
+
+    match = MONTH_PATTERN.match(str(value).strip())
+    if not match:
+        return ""
+    year, month = match.groups()
+    return f"{year}-{int(month):02d}"
+
+
+def to_number(value: Any) -> int | None:
+    """'31,639' 같은 문자열도 숫자로 바꿉니다. 안 되면 None."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().replace(",", "").replace(" ", "")
+    if not text or text in ("-", "—"):
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def last_snapshot_engagement(row: dict) -> tuple[int, int] | None:
+    """게시물 한 줄에서 '가장 마지막에 기록된' 좋아요·댓글을 꺼냅니다.
+
+    Daily_crawl 은 게시 후 3일(D+0~D+2)까지 날짜별로 값을 적어 둡니다.
+    월간 집계에는 그 중 마지막(보통 D+2) 값을 씁니다.
+    """
+    best_day = ""
+    likes = comments = None
+
+    for name, value in row.items():
+        match = SNAPSHOT_LIKE_PATTERN.match(str(name))
+        if not match:
+            continue
+        day = match.group(1)
+        number = to_number(value)
+        if number is None or day < best_day:
+            continue
+        best_day = day
+        likes = number
+        comments = to_number(row.get(f"{day} 댓글"))
+
+    if likes is None:
+        return None
+    return likes, comments or 0
+
+
+def aggregate_monthly_metrics(
+    followers_history: str,
+    daily_crawl_dir: str,
+    brand_map: dict[str, str],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """수집 결과를 (월, 브랜드)별 월간 지표로 묶습니다.
+
+    brand_map 은 accounts.csv 의 이름 → 시트의 브랜드 이름 대응표입니다.
+      예) {"BMW 모토라드 코리아": "모토라드"}
+
+    돌려주는 값
+      {("2026-10", "모토라드"): {"총 팔로워 수": 31639, "월 콘텐츠 수": 20, ...}}
+    """
+    result: dict[tuple[str, str], dict[str, int]] = {}
+
+    # --- 1) 총 팔로워 수: 그 달 '마지막 기록일' 의 값 ------------------------
+    # 월 중간 값이 아니라 월말 기준이어야 달끼리 비교가 됩니다.
+    latest_by_month: dict[tuple[str, str], tuple[str, int]] = {}
+    if os.path.exists(followers_history):
+        _header, records = read_csv_rows(followers_history)
+        for record in records:
+            brand = brand_map.get(str(record.get("account_name", "")).strip())
+            if not brand:
+                continue  # 시트에 없는 계정은 건너뜁니다.
+            day = str(record.get("date", "")).strip()
+            month = month_of(day)
+            followers = to_number(record.get("followers"))
+            if not month or followers is None:
+                continue
+
+            key = (month, brand)
+            previous = latest_by_month.get(key)
+            if previous is None or day >= previous[0]:
+                latest_by_month[key] = (day, followers)
+
+    for key, (_day, followers) in latest_by_month.items():
+        result.setdefault(key, {})[METRIC_TOTAL_FOLLOWERS] = followers
+
+    # --- 2) 신규 팔로워 수 = 이번 달 − 지난 달 -------------------------------
+    # 지난 달 기록이 우리에게 없으면 여기서는 비워 둡니다.
+    # (그 경우엔 뒤에서 시트에 적힌 지난 달 값을 보고 채웁니다)
+    for (month, brand), values in result.items():
+        previous_month = shift_month(month, -1)
+        previous = latest_by_month.get((previous_month, brand))
+        if previous is not None:
+            values[METRIC_NEW_FOLLOWERS] = values[METRIC_TOTAL_FOLLOWERS] - previous[1]
+
+    # --- 3) 월 콘텐츠 수 · 인게이지먼트 --------------------------------------
+    pattern = os.path.join(daily_crawl_dir, "*.xlsx")
+    for path in sorted(glob.glob(pattern)):
+        _header, rows = read_xlsx_rows(path)
+        for row in rows:
+            brand = brand_map.get(str(row.get("계정", "")).strip())
+            if not brand:
+                continue
+            month = month_of(row.get("업로드일"))
+            if not month:
+                continue
+
+            key = (month, brand)
+            values = result.setdefault(key, {})
+            values[METRIC_POST_COUNT] = values.get(METRIC_POST_COUNT, 0) + 1
+
+            engagement = last_snapshot_engagement(row)
+            if engagement is not None:
+                likes, comments = engagement
+                values[METRIC_ENGAGEMENT] = (
+                    values.get(METRIC_ENGAGEMENT, 0) + likes + comments
+                )
+
+    return result
+
+
+def shift_month(month: str, delta: int) -> str:
+    """'2026-10' 에서 몇 달 전/후를 구합니다. ('2026-09')"""
+    try:
+        year, number = month.split("-")
+        total = int(year) * 12 + (int(number) - 1) + delta
+        return f"{total // 12}-{total % 12 + 1:02d}"
+    except (ValueError, AttributeError):
+        return ""
+
+
+def column_index(letter: str) -> int:
+    """'D' → 3 (0부터 세는 열 번호)."""
+    index = 0
+    for char in str(letter).strip().upper():
+        if not char.isalpha():
+            raise UploadError(f"열 이름이 올바르지 않습니다: '{letter}' (예: D)")
+        index = index * 26 + (ord(char) - ord("A") + 1)
+    return index - 1
+
+
+def read_report_grid(
+    service,
+    spreadsheet_id: str,
+    sheet_title: str,
+    scan_rows: int = 500,
+) -> list[list]:
+    """월간 표가 있는 탭의 내용을 통째로 읽어 옵니다(줄 위치를 찾기 위해)."""
+    safe_title = sheet_title.replace("'", "''")
+    range_name = f"'{safe_title}'!A1:Z{scan_rows}"
+    result = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=range_name)
+        .execute()
+    )
+    return result.get("values", [])
+
+
+def find_report_rows(
+    grid: list[list],
+    month_column: str,
+    brand_column: str,
+) -> dict[tuple[str, str], int]:
+    """시트에서 (월, 브랜드) 가 맞는 줄의 행 번호를 찾아 둡니다.
+
+    돌려주는 값: {("2026-10", "모토라드"): 37}   ← 1부터 세는 실제 행 번호
+    """
+    month_index = column_index(month_column)
+    brand_index = column_index(brand_column)
+    found: dict[tuple[str, str], int] = {}
+
+    for offset, raw in enumerate(grid):
+        month = month_of(raw[month_index]) if len(raw) > month_index else ""
+        brand = str(raw[brand_index]).strip() if len(raw) > brand_index else ""
+        if not month or not brand:
+            continue
+        found.setdefault((month, brand), offset + 1)  # 1부터 세는 행 번호
+
+    return found
+
+
+def sheet_cell_value(grid: list[list], row_number: int, letter: str) -> Any:
+    """이미 읽어 둔 표에서 특정 칸의 값을 꺼냅니다(없으면 빈 문자열)."""
+    index = column_index(letter)
+    if row_number - 1 >= len(grid):
+        return ""
+    raw = grid[row_number - 1]
+    return raw[index] if len(raw) > index else ""
+
+
+def build_monthly_updates(
+    metrics: dict[tuple[str, str], dict[str, int]],
+    rows: dict[tuple[str, str], int],
+    grid: list[list],
+    sheet_title: str,
+    columns: dict[str, str],
+    months: list[str] | None = None,
+    overwrite: bool = False,
+) -> tuple[list[dict], list[str]]:
+    """실제로 고쳐 쓸 칸 목록을 만듭니다.
+
+    - 시트에 없는 (월, 브랜드) 는 건너뜁니다. 줄을 새로 만들지 않습니다.
+    - 이미 값이 들어 있는 칸은 그대로 둡니다(overwrite=True 면 덮어씁니다).
+    - 지난 달 기록이 없어 신규 팔로워를 못 구한 경우, 시트에 적힌 지난 달
+      '총 팔로워 수' 를 보고 계산합니다. 수기로 채워 둔 과거와 자연스럽게
+      이어지게 하기 위함입니다.
+    """
+    safe_title = sheet_title.replace("'", "''")
+    updates: list[dict] = []
+    notes: list[str] = []
+
+    for (month, brand) in sorted(metrics):
+        if months and month not in months:
+            continue
+
+        values = dict(metrics[(month, brand)])
+        row_number = rows.get((month, brand))
+        if row_number is None:
+            notes.append(f"시트에 '{month} / {brand}' 줄이 없어 건너뜀")
+            continue
+
+        # 지난 달 값이 우리 기록에 없으면 시트에서 읽어 신규 팔로워를 구합니다.
+        if (
+            METRIC_NEW_FOLLOWERS not in values
+            and METRIC_TOTAL_FOLLOWERS in values
+            and METRIC_TOTAL_FOLLOWERS in columns
+        ):
+            previous_row = rows.get((shift_month(month, -1), brand))
+            if previous_row:
+                previous_total = to_number(
+                    sheet_cell_value(grid, previous_row, columns[METRIC_TOTAL_FOLLOWERS])
+                )
+                if previous_total is not None:
+                    values[METRIC_NEW_FOLLOWERS] = (
+                        values[METRIC_TOTAL_FOLLOWERS] - previous_total
+                    )
+                    notes.append(f"{month} / {brand}: 신규 팔로워는 시트의 지난 달 값으로 계산")
+
+        for metric, letter in columns.items():
+            if metric not in values:
+                continue
+
+            existing = sheet_cell_value(grid, row_number, letter)
+            if existing not in ("", None) and not overwrite:
+                notes.append(
+                    f"{month} / {brand} / {metric}: 이미 값({existing})이 있어 그대로 둠"
+                )
+                continue
+
+            updates.append(
+                {
+                    "range": f"'{safe_title}'!{letter.upper()}{row_number}",
+                    "values": [[values[metric]]],
+                }
+            )
+
+    return updates, notes
+
+
+def apply_updates(service, spreadsheet_id: str, updates: list[dict]) -> int:
+    """고쳐 쓸 칸들을 한 번의 요청으로 반영합니다."""
+    if not updates:
+        return 0
+    result = (
+        service.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": updates},
+        )
+        .execute()
+    )
+    return int(result.get("totalUpdatedCells", 0))
+
+
+def run_monthly_report(
+    config: dict,
+    log_path: str,
+    dry_run: bool = False,
+    months: list[str] | None = None,
+    overwrite: bool = False,
+) -> int:
+    """월간 지표 표를 채웁니다. 돌려주는 값: 0=성공, 1=실패"""
+    settings = config.get("monthly_report")
+    if not settings:
+        return 0  # 설정이 없으면 아무것도 하지 않습니다.
+
+    spreadsheet_id = extract_spreadsheet_id(config["spreadsheet_id"])
+    brand_map = settings.get("brands") or {}
+    if not brand_map:
+        raise UploadError(
+            "monthly_report 에 brands 대응표가 없습니다.\n"
+            "       예) \"brands\": {\"BMW 모토라드 코리아\": \"모토라드\"}"
+        )
+
+    columns = settings.get("columns") or {}
+    unknown = [m for m in columns if m not in MONTHLY_METRICS]
+    if unknown:
+        raise UploadError(
+            f"monthly_report 의 columns 에 모르는 지표가 있습니다: {', '.join(unknown)}\n"
+            f"       쓸 수 있는 지표: {', '.join(MONTHLY_METRICS)}"
+        )
+
+    write_daily_log(log_path, "INFO", "월간 지표 표 채우기")
+
+    metrics = aggregate_monthly_metrics(
+        followers_history=settings.get("followers_history", "followers_history.csv"),
+        daily_crawl_dir=settings.get("daily_crawl_dir", "Daily_crawl"),
+        brand_map=brand_map,
+    )
+    if not metrics:
+        write_daily_log(log_path, "INFO", "  집계할 자료가 없습니다.")
+        return 0
+
+    target_months = months or settings.get("months")
+    if isinstance(target_months, str):
+        target_months = None if target_months == "auto" else [target_months]
+
+    for (month, brand) in sorted(metrics):
+        if target_months and month not in target_months:
+            continue
+        summary = ", ".join(
+            f"{k} {v:,}" for k, v in metrics[(month, brand)].items()
+        )
+        write_daily_log(log_path, "INFO", f"  {month} / {brand}: {summary}")
+
+    if dry_run:
+        write_daily_log(
+            log_path, "INFO", "  [미리보기] 시트를 읽지 않았으므로 여기까지만 확인합니다."
+        )
+        return 0
+
+    service = build_sheets_service(config.get("credentials_file", DEFAULT_CREDENTIALS_FILE))
+    sheets = fetch_sheet_titles(service, spreadsheet_id)
+    sheet_title = resolve_sheet_title(sheets, settings.get("sheet", 0))
+
+    grid = read_report_grid(service, spreadsheet_id, sheet_title)
+    rows = find_report_rows(
+        grid,
+        settings.get("month_column", "B"),
+        settings.get("brand_column", "C"),
+    )
+    write_daily_log(log_path, "INFO", f"  '{sheet_title}' 에서 {len(rows)}개 줄을 찾았습니다.")
+
+    updates, notes = build_monthly_updates(
+        metrics=metrics,
+        rows=rows,
+        grid=grid,
+        sheet_title=sheet_title,
+        columns=columns,
+        months=target_months,
+        overwrite=overwrite or bool(settings.get("overwrite")),
+    )
+    for note in notes:
+        write_daily_log(log_path, "INFO", f"  {note}")
+
+    changed = apply_updates(service, spreadsheet_id, updates)
+    write_daily_log(log_path, "INFO", f"  {len(updates)}칸 기록 (바뀐 칸 {changed}개)")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -585,6 +1041,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="실제로 올리지 않고 무엇이 올라갈지만 확인합니다(인증 없이도 됩니다).",
     )
+    parser.add_argument(
+        "--month",
+        action="append",
+        help="이 달만 처리합니다 (예: --month 2026-10). 여러 번 쓸 수 있습니다.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="시트에 이미 값이 들어 있는 칸도 새 값으로 덮어씁니다.",
+    )
     return parser
 
 
@@ -595,6 +1061,8 @@ def main(argv: list[str] | None = None) -> int:
             config_file=args.config,
             log_dir=args.log_dir,
             dry_run=args.dry_run,
+            months=args.month,
+            overwrite=args.overwrite,
         )
     except UploadError as e:
         print(f"[오류] {e}", file=sys.stderr)
