@@ -343,6 +343,46 @@ def service_account_email(credentials_file: str) -> str:
         return "(알 수 없음)"
 
 
+def build_sheets_service_readonly(api_key: str):
+    """API 키로 '읽기 전용' 접속을 준비합니다.
+
+    API 키는 구글 정책상 쓰기가 되지 않습니다. 시트 구조가 설정과 맞는지
+    미리 확인하는 용도로만 씁니다. 실제 기록에는 서비스 계정이 필요합니다.
+
+    또 하나, API 키로 읽으려면 그 시트가 '링크가 있는 모든 사용자에게 공개'
+    상태여야 합니다. 비공개 시트는 키가 있어도 읽히지 않습니다.
+    """
+    from googleapiclient.discovery import build
+
+    return build("sheets", "v4", developerKey=api_key, cache_discovery=False)
+
+
+def describe_api_key_error(error: Exception, spreadsheet_id: str) -> str:
+    """API 키로 읽다 생긴 오류를 고칠 방법으로 바꿔 줍니다."""
+    text = str(error)
+    status = getattr(getattr(error, "resp", None), "status", None)
+
+    if status == 403 or "PERMISSION_DENIED" in text or "API key not valid" in text:
+        if "API key not valid" in text or "API_KEY_INVALID" in text:
+            return (
+                "API 키가 올바르지 않습니다.\n"
+                "       구글 클라우드 콘솔 → 사용자 인증 정보 에서 키를 다시 확인해 주세요."
+            )
+        return (
+            f"이 시트를 API 키로 읽을 수 없습니다.\n"
+            f"       시트의 '공유' 를 눌러 '링크가 있는 모든 사용자' → '뷰어' 로 바꿔 주세요.\n"
+            f"       (API 키는 공개된 시트만 읽을 수 있습니다)"
+        )
+    if status == 404 or "notFound" in text:
+        return f"그런 시트를 찾지 못했습니다 (ID: {spreadsheet_id}). 주소를 확인해 주세요."
+    if "SERVICE_DISABLED" in text or "has not been used" in text:
+        return (
+            "이 프로젝트에서 Google Sheets API 가 꺼져 있습니다.\n"
+            "       콘솔 → API 및 서비스 → 라이브러리 → 'Google Sheets API' → 사용"
+        )
+    return f"시트를 읽지 못했습니다: {text}"
+
+
 def describe_sheets_error(error: Exception, credentials_file: str, spreadsheet_id: str) -> str:
     """구글이 돌려준 오류를 '무엇을 고쳐야 하는지' 로 바꿔 줍니다.
 
@@ -552,6 +592,7 @@ def run_sheets_upload(
     dry_run: bool = False,
     months: list[str] | None = None,
     overwrite: bool = False,
+    api_key: str | None = None,
 ) -> int:
     """설정에 적힌 내용을 전부 구글 시트에 올립니다.
 
@@ -662,6 +703,7 @@ def run_sheets_upload(
                 dry_run=dry_run,
                 months=months,
                 overwrite=overwrite,
+                api_key=api_key or config.get("api_key"),
             )
             succeeded += 1
         except UploadError as e:
@@ -1074,6 +1116,7 @@ def run_monthly_report(
     dry_run: bool = False,
     months: list[str] | None = None,
     overwrite: bool = False,
+    api_key: str | None = None,
 ) -> int:
     """월간 지표 표를 채웁니다. 돌려주는 값: 0=성공, 1=실패"""
     settings = config.get("monthly_report")
@@ -1144,24 +1187,40 @@ def run_monthly_report(
                 f"인게이지먼트가 실제보다 작습니다.",
             )
 
-    if dry_run:
+    credentials_file = config.get("credentials_file", DEFAULT_CREDENTIALS_FILE)
+    read_only = bool(api_key) and dry_run
+
+    if dry_run and not api_key:
         write_upload_log(
-            log_path, "INFO", "  [미리보기] 시트를 읽지 않았으므로 여기까지만 확인합니다."
+            log_path,
+            "INFO",
+            "  [미리보기] 시트를 읽지 않았으므로 여기까지만 확인합니다. "
+            "(--api-key 를 주면 실제 시트와 대조합니다)",
         )
         return 0
 
-    credentials_file = config.get("credentials_file", DEFAULT_CREDENTIALS_FILE)
-    service = build_sheets_service(credentials_file)
-    try:
-        sheets = fetch_sheet_titles(service, spreadsheet_id)
-    except Exception as e:
-        raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
+    if read_only:
+        # API 키로는 읽기만 됩니다. 설정이 맞는지 대조만 하고 기록은 하지 않습니다.
+        write_upload_log(log_path, "INFO", "  [검증] API 키로 실제 시트를 읽어 대조합니다.")
+        service = build_sheets_service_readonly(api_key)
+        try:
+            sheets = fetch_sheet_titles(service, spreadsheet_id)
+        except Exception as e:
+            raise UploadError(describe_api_key_error(e, spreadsheet_id))
+    else:
+        service = build_sheets_service(credentials_file)
+        try:
+            sheets = fetch_sheet_titles(service, spreadsheet_id)
+        except Exception as e:
+            raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
 
     sheet_title = resolve_sheet_title(sheets, settings.get("sheet", 0))
 
     try:
         grid = read_report_grid(service, spreadsheet_id, sheet_title)
     except Exception as e:
+        if read_only:
+            raise UploadError(describe_api_key_error(e, spreadsheet_id))
         raise UploadError(describe_sheets_error(e, credentials_file, spreadsheet_id))
     rows = find_report_rows(
         grid,
@@ -1181,6 +1240,21 @@ def run_monthly_report(
     )
     for note in notes:
         write_upload_log(log_path, "INFO", f"  {note}")
+
+    if read_only:
+        write_upload_log(
+            log_path, "INFO", f"  [검증] 기록 대상 {len(updates)}칸 — 실제로 쓰지는 않았습니다."
+        )
+        for update in updates:
+            write_upload_log(
+                log_path, "INFO", f"    {update['range']} ← {update['values'][0][0]}"
+            )
+        if not updates:
+            write_upload_log(log_path, "INFO", "    (채울 칸이 없습니다)")
+        write_upload_log(
+            log_path, "INFO", "  실제로 기록하려면 서비스 계정 키가 필요합니다."
+        )
+        return 0
 
     changed = apply_updates(service, spreadsheet_id, updates)
     write_upload_log(log_path, "INFO", f"  {len(updates)}칸 기록 (바뀐 칸 {changed}개)")
@@ -1215,6 +1289,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="실제로 올리지 않고 무엇이 올라갈지만 확인합니다(인증 없이도 됩니다).",
     )
     parser.add_argument(
+        "--api-key",
+        help=(
+            "API 키로 실제 시트를 읽어 설정이 맞는지 검증합니다 (--dry-run 과 함께). "
+            "읽기만 하며 기록은 하지 않습니다."
+        ),
+    )
+    parser.add_argument(
         "--set-sheet",
         metavar="주소",
         help="설정 파일에 구글 시트 주소를 넣고 끝냅니다. (메모장을 열지 않아도 됩니다)",
@@ -1242,12 +1323,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"       이제 'python sheets_uploader.py --dry-run' 으로 확인해 보세요.")
             return 0
 
+        if args.api_key and not args.dry_run:
+            print(
+                "[안내] --api-key 는 읽기 전용이라 기록할 수 없습니다.\n"
+                "       설정 검증만 하려면 --dry-run 을 함께 붙여 주세요.\n"
+                "       실제 기록에는 서비스 계정 키(google_credentials.json)가 필요합니다.",
+                file=sys.stderr,
+            )
+            return 1
+
         return run_sheets_upload(
             config_file=args.config,
             log_dir=args.log_dir,
             dry_run=args.dry_run,
             months=args.month,
             overwrite=args.overwrite,
+            api_key=args.api_key,
         )
     except UploadError as e:
         print(f"[오류] {e}", file=sys.stderr)
