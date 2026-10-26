@@ -36,6 +36,16 @@ LIKE_HINTS = ("like", "liker", "facepile")
 MAX_TEXT = 60
 
 
+def dig(data: Any, *path: str) -> Any:
+    """중첩된 딕셔너리를 안전하게 파고듭니다. 중간에 없으면 None."""
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
 def summarize(value: Any) -> str:
     """값을 한 줄로 요약합니다. 목록이면 길이를, 딕셔너리면 키 구성을 보여줍니다."""
     if isinstance(value, dict):
@@ -88,6 +98,25 @@ def main(argv: list[str]) -> int:
         code = post.get("code") or post.get("shortcode") or post.get("shortCode") or "?"
         print(f"\n[{index}] https://instagram.com/p/{code}/")
 
+        # 누구 글인지 확인합니다.
+        # 인스타그램이 '추천 게시물' 로 남의 글을 끼워 넣는 경우가 있어,
+        # 좋아요가 이상할 때 '우리 계정 글이 맞는지' 부터 가려야 합니다.
+        owner = (
+            dig(post, "user", "username")
+            or dig(post, "owner", "username")
+            or post.get("ownerUsername")
+            or "(알 수 없음)"
+        )
+        day = (
+            post.get("taken_at_date")
+            or post.get("timestamp")
+            or post.get("taken_at")
+            or post.get("taken_at_timestamp")
+            or "(알 수 없음)"
+        )
+        print(f"    {'계정':38s} = @{owner}")
+        print(f"    {'업로드':38s} = {day}")
+
         like_fields = collect_like_fields(post)
         if not like_fields:
             print("    좋아요 관련 필드를 하나도 찾지 못했습니다.")
@@ -104,7 +133,28 @@ def main(argv: list[str]) -> int:
         comment = post.get("comment_count", post.get("commentsCount", "(없음)"))
         print(f"    {'comment_count (비교용)':38s} = {comment}")
 
+    # 계정별로 몇 건씩 잡혔는지 — 남의 글이 섞였는지 바로 보입니다.
+    owners: dict[str, int] = {}
+    hidden = 0
+    for post in data:
+        if not isinstance(post, dict):
+            continue
+        name = (
+            dig(post, "user", "username")
+            or dig(post, "owner", "username")
+            or post.get("ownerUsername")
+            or "(알 수 없음)"
+        )
+        owners[name] = owners.get(name, 0) + 1
+        if post.get("like_and_view_counts_disabled") is True:
+            hidden += 1
+
     print()
+    print("-" * 66)
+    print(" 계정별 건수:")
+    for name, count in sorted(owners.items(), key=lambda x: -x[1]):
+        print(f"   @{name}: {count}건")
+    print(f" 좋아요 수를 숨긴 게시물: {hidden} / {len(data)}건")
     print("-" * 66)
     print(" 이 출력을 그대로 공유해 주시면 어떤 필드를 써야 하는지 맞출 수 있습니다.")
     print(" (본문·이미지 주소 등은 출력에 포함되지 않습니다)")
