@@ -686,6 +686,117 @@ def normalize_caption(post: dict) -> str:
     return clean_text(get_first(post, "caption_text", "text", default=""))
 
 
+# 인스타그램이 '좋아요 수 숨김' 을 알려주는 필드들
+HIDDEN_COUNT_FLAGS = (
+    "like_and_view_counts_disabled",
+    "like_count_disabled",
+    "hide_like_and_view_counts",
+)
+
+# 미리보기로 딸려오는 '좋아요 누른 사람' 목록은 보통 이 개수 이하입니다.
+# 총 개수가 이 목록 길이와 똑같으면 총 개수가 아니라 미리보기일 수 있습니다.
+PREVIEW_LIKER_MAX = 12
+
+
+def counts_hidden(post: dict) -> bool:
+    """그 게시물이 '좋아요 수 숨김' 상태인지 확인합니다.
+
+    인스타그램 화면에 'OOO님 외 여러 명이 좋아합니다' 로만 보이는 글입니다.
+    이런 글은 총 좋아요 수를 외부에서 알 수 없습니다.
+    """
+    return any(post.get(flag) is True for flag in HIDDEN_COUNT_FLAGS)
+
+
+def as_count(value: Any) -> int | None:
+    """숫자로 쓸 수 있는 개수만 돌려줍니다. 음수나 숫자가 아니면 None.
+
+    인스타그램은 '모름' 을 -1 로 표현하기도 해서, 그대로 기록하면
+    합계와 평균이 망가집니다.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value) if value >= 0 else None
+    text = str(value).strip().replace(",", "")
+    if text.lstrip("-").isdigit():
+        number = int(text)
+        return number if number >= 0 else None
+    return None
+
+
+def trusted_edge_count(node: Any, distrust_preview: bool = False) -> int | None:
+    """edge_xxx 구조에서 '믿을 수 있는 총 개수' 만 꺼냅니다.
+
+    인스타그램은 좋아요 수를 숨긴 글에서, 총 개수 대신 미리보기로 보여줄
+    사람 몇 명(보통 3명)의 수를 count 에 담아 보내기도 합니다.
+    그걸 그대로 쓰면 좋아요가 3개인 것처럼 기록됩니다.
+
+    그래서 count 가 함께 온 목록의 길이와 똑같고 그 수가 작으면
+    총 개수가 아니라고 보고 쓰지 않습니다.
+    """
+    if not isinstance(node, dict):
+        return None
+
+    count = as_count(node.get("count"))
+    if count is None:
+        return None
+
+    if distrust_preview:
+        edges = node.get("edges")
+        if (
+            isinstance(edges, list)
+            and edges
+            and len(edges) == count
+            and count <= PREVIEW_LIKER_MAX
+        ):
+            return None  # 미리보기 명단 길이로 보입니다.
+
+    return count
+
+
+def extract_like_count(post: dict) -> int | None:
+    """좋아요 수를 꺼냅니다. 알 수 없으면 None.
+
+    숨겨진 글을 0 이나 3 으로 적으면 평균·합계가 조용히 틀어집니다.
+    그래서 '모른다' 는 빈 칸으로 남깁니다.
+    """
+    if counts_hidden(post):
+        return None
+
+    # 1) 총 개수를 그대로 알려주는 필드가 가장 믿을 만합니다.
+    for key in ("like_count", "likesCount", "likes"):
+        count = as_count(post.get(key))
+        if count is not None:
+            return count
+
+    # 2) 웹(GraphQL) 구조. 미리보기 명단일 수 있으니 걸러서 씁니다.
+    for key in ("edge_media_preview_like", "edge_liked_by"):
+        count = trusted_edge_count(post.get(key), distrust_preview=True)
+        if count is not None:
+            return count
+
+    return None
+
+
+def extract_comment_count(post: dict) -> int | None:
+    """댓글 수를 꺼냅니다. 알 수 없으면 None.
+
+    댓글은 원래 한 자릿수인 경우가 흔해서, 좋아요와 달리
+    '작은 수는 미리보기일 것' 이라는 판단을 적용하지 않습니다.
+    """
+    for key in ("comment_count", "commentsCount", "comments"):
+        count = as_count(post.get(key))
+        if count is not None:
+            return count
+
+    for key in ("edge_media_to_comment", "edge_media_preview_comment"):
+        count = trusted_edge_count(post.get(key))
+        if count is not None:
+            return count
+
+    return None
+
+
 def normalize_post(post: dict) -> dict | None:
     """원본 게시물 하나를 CSV 한 줄(딕셔너리)로 변환합니다.
 
@@ -700,24 +811,15 @@ def normalize_post(post: dict) -> dict | None:
         get_first(post, "taken_at_date", "timestamp", "taken_at", "taken_at_timestamp")
     )
 
-    like_count = get_first(post, "like_count", "likesCount", "likes")
-    if like_count is None:
-        like_count = dig(post, "edge_media_preview_like", "count")
-    if like_count is None:
-        like_count = dig(post, "edge_liked_by", "count")
-
-    comment_count = get_first(post, "comment_count", "commentsCount", "comments")
-    if comment_count is None:
-        comment_count = dig(post, "edge_media_to_comment", "count")
-    if comment_count is None:
-        comment_count = dig(post, "edge_media_preview_comment", "count")
+    like_count = extract_like_count(post)
+    comment_count = extract_comment_count(post)
 
     return {
         "구분": "",  # 게시물 행은 비워두고, 요약 행에만 '평균' 등이 들어갑니다.
         "업로드일": date,
         "타입": normalize_media_format(post),
-        "좋아요": to_int(like_count),
-        "댓글": to_int(comment_count),
+        "좋아요": "" if like_count is None else like_count,
+        "댓글": "" if comment_count is None else comment_count,
         "참여율(%)": "",  # 팔로워 수를 알아야 계산되므로 나중에 채웁니다.
         "본문": normalize_caption(post),
         "링크": f"https://instagram.com/p/{code}/",
